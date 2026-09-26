@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>SessionSpot</string>
+	<string>ccs</string>
 	<key>CFBundleExecutable</key>
-	<string>SessionSpot</string>
+	<string>ccs</string>
 	<key>CFBundleIdentifier</key>
-	<string>local.sessionspot.app</string>
+	<string>local.ccs.app</string>
 	<key>CFBundleName</key>
-	<string>SessionSpot</string>
+	<string>ccs</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
