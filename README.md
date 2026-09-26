@@ -12,6 +12,8 @@ The session list and search results are always sorted by session start time, new
 
 For Claude sessions, SessionSpot checks the associated process and conversation log. A green spinner and **Running** mean the session is responding; **Idle** means its process is open but it is not responding. For Codex sessions, a session lock indicates **Running**. **History** means no active session was detected. Status updates every 12 seconds.
 
+An orange dot in the menu bar means at least one session has a new assistant message since you last opened or previewed it. Unread sessions also have a dot beside their title. Opening or previewing a session marks it as read. On the first run with unread tracking, existing history starts as read.
+
 The first indexing pass may take time for large histories. Subsequent passes ingest new content every 12 seconds. The local index is stored at `~/Library/Application Support/SessionSpot/index.sqlite3`. Keyword search runs locally.
 
 ## Supported history

@@ -57,6 +57,7 @@ final class Store {
     private var indexing = false
     private var repaired = false
     var onStatus: ((String) -> Void)?
+    var onUnreadPaths: ((Set<String>) -> Void)?
 
     init() {
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/SessionSpot")
@@ -72,7 +73,10 @@ final class Store {
         exec("ALTER TABLE files ADD COLUMN updated REAL NOT NULL DEFAULT 0")
         exec("CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, file TEXT NOT NULL, source TEXT NOT NULL, project TEXT NOT NULL, role TEXT NOT NULL, body TEXT NOT NULL, stamp TEXT NOT NULL)")
         exec("CREATE INDEX IF NOT EXISTS messages_file ON messages(file)")
+        exec("CREATE INDEX IF NOT EXISTS messages_role_file_id ON messages(role,file,id)")
         exec("CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(body, tokenize='trigram')")
+        exec("CREATE TABLE IF NOT EXISTS read_state(path TEXT PRIMARY KEY, assistant_id INTEGER NOT NULL)")
+        exec("CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     }
     deinit { sqlite3_close(writer) }
     private func exec(_ sql: String) { sqlite3_exec(writer, sql, nil, nil, nil) }
@@ -126,7 +130,41 @@ final class Store {
                 if i % 30 == 0 { self.onStatus?("Indexing · \(i + 1)/\(paths.count) files") }
             }
             if !self.repaired { self.repairStartedTimes(); self.repaired = true }
+            self.initializeUnreadTracking()
+            self.publishUnreadPaths()
             self.onStatus?("\(paths.count) session files · \(changed) updated")
+        }
+    }
+    private func initializeUnreadTracking() {
+        let check = prepare("SELECT 1 FROM metadata WHERE key='unread_initialized'", db: writer)
+        let initialized = sqlite3_step(check) == SQLITE_ROW
+        sqlite3_finalize(check)
+        guard !initialized else { return }
+        exec("BEGIN")
+        exec("INSERT OR REPLACE INTO read_state(path,assistant_id) SELECT file,MAX(id) FROM messages WHERE role='assistant' GROUP BY file")
+        exec("INSERT OR REPLACE INTO metadata(key,value) VALUES('unread_initialized','1')")
+        exec("COMMIT")
+    }
+    private func publishUnreadPaths() {
+        let sql = "SELECT latest.file FROM (SELECT file,MAX(id) AS assistant_id FROM messages WHERE role='assistant' GROUP BY file) latest LEFT JOIN read_state r ON r.path=latest.file WHERE latest.assistant_id > COALESCE(r.assistant_id,0)"
+        guard let statement = prepare(sql, db: writer) else { return }
+        var paths = Set<String>()
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let value = sqlite3_column_text(statement, 0) { paths.insert(String(cString: value)) }
+        }
+        sqlite3_finalize(statement)
+        onUnreadPaths?(paths)
+    }
+    func markRead(_ path: String) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let sql = "INSERT INTO read_state(path,assistant_id) SELECT file,MAX(id) FROM messages WHERE file=? AND role='assistant' GROUP BY file ON CONFLICT(path) DO UPDATE SET assistant_id=MAX(read_state.assistant_id,excluded.assistant_id)"
+            if let statement = self.prepare(sql, db: self.writer) {
+                self.bind(statement, 1, path)
+                sqlite3_step(statement)
+                sqlite3_finalize(statement)
+            }
+            self.publishUnreadPaths()
         }
     }
     private func repairStartedTimes() {
@@ -449,6 +487,8 @@ final class Store {
     @Published var claudeProcesses = Set<String>()
     @Published var claudeWorking = Set<String>()
     @Published var codexLocks = Set<String>()
+    @Published var unreadPaths = Set<String>() { didSet { onUnreadChanged?(unreadPaths.count) } }
+    var onUnreadChanged: ((Int) -> Void)?
     let store = Store()
     private var generation = 0
     init() {
@@ -456,6 +496,9 @@ final class Store {
             guard let self else { return }
             self.status = s
             if !s.hasPrefix("Indexing") { self.search() }
+        } }
+        store.onUnreadPaths = { [weak self] paths in DispatchQueue.main.async {
+            if self?.unreadPaths != paths { self?.unreadPaths = paths }
         } }
         search()
         store.refresh()
@@ -469,6 +512,10 @@ final class Store {
     }
     func isOpen(_ hit: Hit) -> Bool {
         hit.source == "Claude" && claudeProcesses.contains(hit.sessionID)
+    }
+    func preview(_ hit: Hit) {
+        store.markRead(hit.path)
+        selected = hit
     }
     nonisolated private static func claudeTurnActive(at path: String) -> Bool {
         guard let handle = FileHandle(forReadingAtPath: path) else { return false }
@@ -512,7 +559,7 @@ final class Store {
     }
     func openSession(_ hit: Hit) {
         if hit.source == "Claude", hit.desktopID == nil {
-            selected = hit
+            preview(hit)
             status = "This CLI session has no matching Claude Desktop entry"
             return
         }
@@ -523,6 +570,7 @@ final class Store {
             address = "codex://threads/\(hit.sessionID)"
         }
         if let url = URL(string: address), NSWorkspace.shared.open(url) {
+            store.markRead(hit.path)
             NSApp.keyWindow?.orderOut(nil)
         } else {
             status = "Could not open the desktop app"
@@ -647,6 +695,10 @@ struct SearchView: View {
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.96))
                         .lineLimit(1)
+                    if model.unreadPaths.contains(hit.path) {
+                        Circle().fill(Color.orange).frame(width: 7, height: 7)
+                            .accessibilityLabel("Unread")
+                    }
                     if !hit.github.isEmpty {
                         Image(systemName: "link").font(.system(size: 10, weight: .bold)).foregroundStyle(muted)
                     }
@@ -669,7 +721,7 @@ struct SearchView: View {
                 Text(date(hit.started)).font(.system(size: 11)).foregroundStyle(muted)
             }
             .frame(minWidth: 64, alignment: .trailing)
-            Button { model.selected = hit } label: {
+            Button { model.preview(hit) } label: {
                 Image(systemName: "text.alignleft")
                     .font(.system(size: 12))
                     .foregroundStyle(muted)
@@ -686,7 +738,7 @@ struct SearchView: View {
         .onHover { hoveredID = $0 ? hit.id : nil }
         .onTapGesture { model.openSession(hit) }
         .contextMenu {
-            Button("Preview conversation") { model.selected = hit }
+            Button("Preview conversation") { model.preview(hit) }
             Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: hit.path)]) }
             ForEach(hit.github, id: \.url) { ref in
                 Button(ref.label) { if let url = URL(string: ref.url) { NSWorkspace.shared.open(url) } }
@@ -808,6 +860,8 @@ final class SearchPanel: NSPanel {
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         status.button?.image = NSImage(systemSymbolName: "sparkle.magnifyingglass", accessibilityDescription: "SessionSpot")
         status.button?.target = self; status.button?.action = #selector(toggle)
+        model.onUnreadChanged = { [weak self] count in self?.updateUnreadIndicator(count) }
+        updateUnreadIndicator(model.unreadPaths.count)
         panel = SearchPanel(contentRect: NSRect(x: 0, y: 0, width: 720, height: 580), styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
         panel.titleVisibility = .hidden; panel.titlebarAppearsTransparent = true
         panel.isFloatingPanel = true; panel.level = .floating; panel.isReleasedWhenClosed = false
@@ -831,6 +885,13 @@ final class SearchPanel: NSPanel {
         else { model.listRevision += 1; panel.center(); panel.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
     }
     @objc func refresh() { model.store.refresh() }
+    private func updateUnreadIndicator(_ count: Int) {
+        status.length = count > 0 ? NSStatusItem.variableLength : NSStatusItem.squareLength
+        status.button?.attributedTitle = count > 0
+            ? NSAttributedString(string: " ●", attributes: [.foregroundColor: NSColor.systemOrange, .font: NSFont.systemFont(ofSize: 12)])
+            : NSAttributedString(string: "")
+        status.button?.toolTip = count == 0 ? "No unread sessions" : "\(count) unread session\(count == 1 ? "" : "s")"
+    }
     @objc func quit() { NSApp.terminate(nil) }
 }
 
