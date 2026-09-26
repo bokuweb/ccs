@@ -6,7 +6,7 @@ SessionSpot is a macOS menu bar app for searching local Claude Code and Codex co
 
 1. Unzip `SessionSpot.zip` and launch `SessionSpot.app`. It stays in the menu bar.
 2. Press `⌘⇧Space` or click the menu bar search icon to open the search panel.
-3. Type to search conversation text and project names. Click a session to open it in Codex or Claude Desktop. Use the icon at the right to preview the conversation. Linked GitHub pull requests and issues appear in the row and can be opened from its context menu. Press `Esc` to close the panel.
+3. Type to search conversation text and project names. Press `Ctrl+N` or `Ctrl+P` to select the next or previous session, and `Enter` to open the selected session. You can also click a session to open it in Codex or Claude Desktop. Use the icon at the right to preview the conversation. Linked GitHub pull requests and issues appear in the row and can be opened from its context menu. Press `Esc` to close the panel.
 
 The session list and search results are always sorted by session start time, newest first. Session titles are the primary heading. The Claude and Codex icons have transparent backgrounds. SessionSpot prefers titles and pull request links stored by Claude Desktop, and also detects issue and pull request URLs in conversation text.
 

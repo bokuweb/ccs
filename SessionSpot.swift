@@ -440,9 +440,10 @@ final class Store {
 }
 
 @MainActor final class Model: ObservableObject {
-    @Published var query = "" { didSet { listRevision += 1; search() } }
+    @Published var query = "" { didSet { highlightedID = nil; listRevision += 1; search() } }
     @Published var listRevision = 0
     @Published var results: [Hit] = []
+    @Published var highlightedID: Int64?
     @Published var selected: Hit?
     @Published var status = "Preparing index…"
     @Published var claudeProcesses = Set<String>()
@@ -583,9 +584,23 @@ final class Store {
             DispatchQueue.main.async {
                 guard let self, current == self.generation else { return }
                 self.results = hits
+                if !hits.contains(where: { $0.id == self.highlightedID }) {
+                    self.highlightedID = hits.first?.id
+                }
                 self.refreshProcesses()
             }
         }
+    }
+
+    var highlightedHit: Hit? {
+        results.first(where: { $0.id == highlightedID }) ?? results.first
+    }
+
+    func moveSelection(_ offset: Int) {
+        guard !results.isEmpty else { highlightedID = nil; return }
+        selected = nil
+        let index = results.firstIndex(where: { $0.id == highlightedID }) ?? 0
+        highlightedID = results[min(max(index + offset, 0), results.count - 1)].id
     }
 
 }
@@ -666,7 +681,7 @@ struct SearchView: View {
         .padding(.horizontal, 13)
         .frame(height: 64)
         .frame(maxWidth: .infinity)
-        .background(hoveredID == hit.id ? raised : .clear, in: RoundedRectangle(cornerRadius: 9))
+        .background(model.highlightedID == hit.id ? raised : hoveredID == hit.id ? Color.white.opacity(0.06) : .clear, in: RoundedRectangle(cornerRadius: 9))
         .contentShape(Rectangle())
         .onHover { hoveredID = $0 ? hit.id : nil }
         .onTapGesture { model.openSession(hit) }
@@ -688,7 +703,7 @@ struct SearchView: View {
                     .textFieldStyle(.plain)
                     .font(.system(size: 22, weight: .regular))
                     .focused($focus)
-                    .onSubmit { if let hit = model.results.first { model.openSession(hit) } }
+                    .onSubmit { if let hit = model.highlightedHit { model.openSession(hit) } }
             }
             .padding(.horizontal, 24)
             .frame(height: 76)
@@ -732,14 +747,20 @@ struct SearchView: View {
                 .padding(.horizontal, 22)
                 .padding(.bottom, 14)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 2) {
-                        ForEach(model.results) { hit in sessionRow(hit) }
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 2) {
+                            ForEach(model.results) { hit in sessionRow(hit).id(hit.id) }
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 10)
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.bottom, 10)
+                    .id(model.listRevision)
+                    .onChange(of: model.highlightedID) { _, id in
+                        guard let id else { return }
+                        withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(id, anchor: .center) }
+                    }
                 }
-                .id(model.listRevision)
             }
             Divider().overlay(.white.opacity(0.05))
             HStack(spacing: 12) {
@@ -764,8 +785,17 @@ struct SearchView: View {
 }
 
 final class SearchPanel: NSPanel {
+    var onMoveSelection: ((Int) -> Void)?
     override var canBecomeKey: Bool { true }
     override func cancelOperation(_ sender: Any?) { orderOut(nil) }
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown,
+           event.modifierFlags.intersection([.control, .command, .option, .shift]) == .control {
+            if event.keyCode == kVK_ANSI_N { onMoveSelection?(1); return }
+            if event.keyCode == kVK_ANSI_P { onMoveSelection?(-1); return }
+        }
+        super.sendEvent(event)
+    }
 }
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -783,6 +813,7 @@ final class SearchPanel: NSPanel {
         panel.isFloatingPanel = true; panel.level = .floating; panel.isReleasedWhenClosed = false
         panel.backgroundColor = NSColor(red: 0.105, green: 0.106, blue: 0.115, alpha: 1)
         panel.contentView = NSHostingView(rootView: SearchView(model: model))
+        panel.onMoveSelection = { [weak model] offset in model?.moveSelection(offset) }
         panel.center()
         let id = EventHotKeyID(signature: OSType(0x53535054), id: 1)
         RegisterEventHotKey(UInt32(kVK_Space), UInt32(cmdKey | shiftKey), id, GetApplicationEventTarget(), 0, &hotKey)
