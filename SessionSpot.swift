@@ -678,7 +678,6 @@ private struct ResultRowFrames: PreferenceKey {
 struct SearchView: View {
     @ObservedObject var model: Model
     @FocusState private var focus: Bool
-    @State private var hoveredID: Int64?
     @State private var resultRowFrames: [Int64: CGRect] = [:]
     private let surface = Color(red: 0.105, green: 0.106, blue: 0.115)
     private let raised = Color(red: 0.18, green: 0.18, blue: 0.19)
@@ -779,7 +778,7 @@ struct SearchView: View {
         .padding(.horizontal, 13)
         .frame(height: searchPhrase.isEmpty ? 64 : 84)
         .frame(maxWidth: .infinity)
-        .background(model.highlightedID == hit.id ? raised : hoveredID == hit.id ? Color.white.opacity(0.06) : .clear, in: RoundedRectangle(cornerRadius: 9))
+        .background(model.highlightedID == hit.id ? raised : .clear, in: RoundedRectangle(cornerRadius: 9))
         .background {
             GeometryReader { geometry in
                 Color.clear.preference(key: ResultRowFrames.self,
@@ -787,7 +786,6 @@ struct SearchView: View {
             }
         }
         .contentShape(Rectangle())
-        .onHover { hoveredID = $0 ? hit.id : nil }
         .onTapGesture { model.openSession(hit) }
         .contextMenu {
             Button("Preview conversation") { model.preview(hit) }
