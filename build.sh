@@ -1,11 +1,16 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")"
-mkdir -p SessionSpot.app/Contents/MacOS SessionSpot.app/Contents/Resources
-cp Info.plist SessionSpot.app/Contents/Info.plist
-cp ClaudeLogo.png CodexLogo.png SessionSpot.app/Contents/Resources/
-rm -f SessionSpot.app/Contents/Resources/ProviderLogos.png
-swiftc -parse-as-library -O -framework AppKit -framework SwiftUI -framework Carbon -lsqlite3 SessionSpot.swift -o SessionSpot.app/Contents/MacOS/SessionSpot
-xattr -cr SessionSpot.app
-codesign --force --deep --sign - SessionSpot.app
-ditto -c -k --sequesterRsrc --keepParent SessionSpot.app SessionSpot.zip
+# Stage on the system volume: external volumes may create AppleDouble sidecars
+# that cannot be processed by xattr/codesign.
+build_dir=$(mktemp -d "${TMPDIR:-/tmp}/ccs-build.XXXXXX")
+trap 'rm -rf "$build_dir"' EXIT
+app="$build_dir/ccs.app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp Info.plist "$app/Contents/Info.plist"
+cp ClaudeLogo.png CodexLogo.png "$app/Contents/Resources/"
+swiftc -parse-as-library -O -framework AppKit -framework SwiftUI -framework Carbon -framework Security -framework ServiceManagement -lsqlite3 ccs.swift Accounts.swift Settings.swift -o "$app/Contents/MacOS/ccs"
+xattr -cr "$app"
+codesign --force --deep --sign - "$app"
+ditto "$app" ccs.app
+ditto -c -k --sequesterRsrc --keepParent "$app" ccs.zip
