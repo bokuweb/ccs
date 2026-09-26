@@ -33,10 +33,13 @@ struct Hit: Identifiable, Hashable {
     }
     func teaser(_ phrase: String) -> String {
         let flat = text.replacingOccurrences(of: "\n", with: " ")
-        guard !phrase.isEmpty, let range = flat.range(of: phrase, options: .caseInsensitive) else { return String(flat.prefix(230)) }
-        let start = flat.index(range.lowerBound, offsetBy: -70, limitedBy: flat.startIndex) ?? flat.startIndex
-        let end = flat.index(range.upperBound, offsetBy: 150, limitedBy: flat.endIndex) ?? flat.endIndex
-        return (start == flat.startIndex ? "" : "…") + String(flat[start..<end]) + (end == flat.endIndex ? "" : "…")
+        let value = [flat, title, project].first {
+            !phrase.isEmpty && $0.range(of: phrase, options: .caseInsensitive) != nil
+        } ?? flat
+        guard !phrase.isEmpty, let range = value.range(of: phrase, options: .caseInsensitive) else { return String(value.prefix(230)) }
+        // Start at the match: even a narrow row must not truncate the matching words away.
+        let end = value.index(range.upperBound, offsetBy: 65, limitedBy: value.endIndex) ?? value.endIndex
+        return (range.lowerBound == value.startIndex ? "" : "…") + String(value[range.lowerBound..<end]) + (end == value.endIndex ? "" : "…")
     }
 }
 
@@ -52,6 +55,7 @@ struct GitHubRef: Hashable {
 
 final class Store {
     let path: String
+    private let metadataHome: URL
     private var writer: OpaquePointer?
     private let queue = DispatchQueue(label: "sessionspot.index", qos: .utility)
     private var indexing = false
@@ -59,10 +63,11 @@ final class Store {
     var onStatus: ((String) -> Void)?
     var onUnreadPaths: ((Set<String>) -> Void)?
 
-    init() {
+    init(databasePath: String? = nil, metadataHome: URL = FileManager.default.homeDirectoryForCurrentUser) {
+        self.metadataHome = metadataHome
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/SessionSpot")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        path = dir.appendingPathComponent("index.sqlite3").path
+        path = databasePath ?? dir.appendingPathComponent("index.sqlite3").path
         sqlite3_open(path, &writer)
         exec("PRAGMA journal_mode=WAL")
         exec("PRAGMA synchronous=NORMAL")
@@ -328,10 +333,14 @@ final class Store {
         guard !text.isEmpty else { return nil }
         return (role, String(text.prefix(20_000)), stamp)
     }
-    private func enrich(_ hits: inout [Hit], db: OpaquePointer?) {
+    private struct SessionMetadata {
+        var codex: [String: (String, Double)]
+        var claude: [String: [String: Any]]
+    }
+    private func loadSessionMetadata() -> SessionMetadata {
         var codex: [String: (String, Double)] = [:]
         var claude: [String: [String: Any]] = [:]
-        let claudeRoot = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Claude/claude-code-sessions")
+        let claudeRoot = metadataHome.appendingPathComponent("Library/Application Support/Claude/claude-code-sessions")
         if let files = FileManager.default.enumerator(at: claudeRoot, includingPropertiesForKeys: nil) {
             for case let url as URL in files where url.pathExtension == "json" {
                 guard let data = try? Data(contentsOf: url),
@@ -340,7 +349,7 @@ final class Store {
                 claude[cli] = info
             }
         }
-        let state = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/state_5.sqlite").path
+        let state = metadataHome.appendingPathComponent(".codex/state_5.sqlite").path
         var stateDB: OpaquePointer?
         if sqlite3_open_v2(state, &stateDB, SQLITE_OPEN_READONLY, nil) == SQLITE_OK {
             if let stmt = prepare("SELECT id,COALESCE(NULLIF(name,''),title),created_at FROM threads", db: stateDB) {
@@ -352,26 +361,35 @@ final class Store {
             }
         }
         if stateDB != nil { sqlite3_close(stateDB) }
+        return SessionMetadata(codex: codex, claude: claude)
+    }
+    private func externalTitle(_ hit: Hit, metadata: SessionMetadata) -> String? {
+        if hit.source == "Codex" { return metadata.codex[hit.sessionID]?.0 }
+        if let title = metadata.claude[hit.sessionID]?["title"] as? String, !title.isEmpty { return title }
+        let customTitle = URL(fileURLWithPath: hit.path).deletingPathExtension().appendingPathComponent("custom-title.json")
+        guard let data = try? Data(contentsOf: customTitle),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+              let title = json["customTitle"], !title.isEmpty else { return nil }
+        return title
+    }
+    private func enrich(_ hits: inout [Hit], db: OpaquePointer?, metadata: SessionMetadata) {
+        let codex = metadata.codex
+        let claude = metadata.claude
         let linksPattern = try? NSRegularExpression(pattern: "https?://github\\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(pull|issues)/([0-9]+)", options: .caseInsensitive)
         let first = prepare("SELECT body,stamp FROM messages WHERE file=? AND role='user' ORDER BY id LIMIT 1", db: db)
         let links = prepare("SELECT body FROM messages WHERE file=? AND body LIKE '%github.com/%' LIMIT 40", db: db)
         for i in hits.indices {
             let session = hits[i].sessionID
-            if let info = codex[session] {
-                hits[i].title = info.0
+            if hits[i].source == "Codex", let info = codex[session] {
                 if info.1 > 0 { hits[i].started = info.1 }
             }
             if hits[i].source == "Claude" {
                 if let info = claude[session] {
                     hits[i].desktopID = info["sessionId"] as? String
-                    if let title = info["title"] as? String, !title.isEmpty { hits[i].title = title }
                     if let created = info["createdAt"] as? NSNumber { hits[i].started = created.doubleValue / 1000 }
                 }
-                let customTitle = URL(fileURLWithPath: hits[i].path).deletingPathExtension().appendingPathComponent("custom-title.json")
-                if let data = try? Data(contentsOf: customTitle),
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: String],
-                   let title = json["customTitle"], !title.isEmpty, hits[i].title.isEmpty { hits[i].title = title }
             }
+            if let title = externalTitle(hits[i], metadata: metadata) { hits[i].title = title }
             bind(first, 1, hits[i].path)
             if sqlite3_step(first) == SQLITE_ROW {
                 if hits[i].title.isEmpty, let raw = sqlite3_column_text(first, 0) {
@@ -425,7 +443,7 @@ final class Store {
                 sql = "SELECT m.id,m.source,m.project,m.role,m.body,m.file,m.stamp,f.started,f.updated,f.turn_active FROM messages m JOIN files f ON f.path=m.file WHERE m.id IN (SELECT max(m2.id) FROM messages m2 WHERE m2.body LIKE ? ESCAPE '\\' GROUP BY m2.file) ORDER BY \(order),m.id DESC LIMIT 120"
             }
             guard let st = self.prepare(sql, db: db) else { completion([]); return }
-            if !q.isEmpty { self.bind(st, 1, "%" + q.replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_") + "%") }
+            if !q.isEmpty { self.bind(st, 1, "%" + q.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_") + "%") }
             var hits: [Hit] = []
             while sqlite3_step(st) == SQLITE_ROW {
                 func col(_ n: Int32) -> String { guard let p = sqlite3_column_text(st, n) else { return "" }; return String(cString: p) }
@@ -434,7 +452,7 @@ final class Store {
             sqlite3_finalize(st)
             if !q.isEmpty {
                 if let byProject = self.prepare("SELECT m.id,m.source,m.project,m.role,m.body,m.file,m.stamp,f.started,f.updated,f.turn_active FROM messages m JOIN files f ON f.path=m.file WHERE m.id IN (SELECT max(id) FROM messages WHERE project LIKE ? ESCAPE '\\' GROUP BY file) ORDER BY \(order),m.id DESC LIMIT 60", db: db) {
-                    self.bind(byProject, 1, "%" + q.replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_") + "%")
+                    self.bind(byProject, 1, "%" + q.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_") + "%")
                     var seen = Set(hits.map(\.id))
                     while sqlite3_step(byProject) == SQLITE_ROW {
                         func col(_ n: Int32) -> String { guard let p = sqlite3_column_text(byProject, n) else { return "" }; return String(cString: p) }
@@ -444,41 +462,36 @@ final class Store {
                     sqlite3_finalize(byProject)
                 }
             }
-            if q.count >= 4 && hits.count < 20 {
-                let chars = Array(q.lowercased())
-                let grams = Array(Set((0...(chars.count - 3)).map { String(chars[$0...($0 + 2)]) })).sorted()
-                let expression = grams.map { "\"" + $0.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }.joined(separator: " OR ")
-                if let fuzzy = self.prepare("SELECT m.id,m.source,m.project,m.role,m.body,m.file,m.stamp,f.started,f.updated,f.turn_active FROM search s JOIN messages m ON m.id=s.rowid JOIN files f ON f.path=m.file WHERE search MATCH ? ORDER BY bm25(search) LIMIT 300", db: db) {
-                    self.bind(fuzzy, 1, expression)
-                    let existing = Set(hits.map(\.id))
-                    var extras: [(Hit, Double)] = []
-                    while sqlite3_step(fuzzy) == SQLITE_ROW {
-                        func col(_ n: Int32) -> String { guard let p = sqlite3_column_text(fuzzy, n) else { return "" }; return String(cString: p) }
-                        let hit = Hit(id: sqlite3_column_int64(fuzzy, 0), source: col(1), project: col(2), role: col(3), text: col(4), path: col(5), timestamp: col(6), started: sqlite3_column_double(fuzzy, 7), updated: sqlite3_column_double(fuzzy, 8), turnActive: sqlite3_column_int(fuzzy, 9) != 0)
-                        if existing.contains(hit.id) { continue }
-                        let body = hit.text.lowercased()
-                        let overlap = grams.filter { body.contains($0) }.count
-                        let score = Double(overlap) / Double(grams.count)
-                        if score >= 0.5 { extras.append((hit, score)) }
+            let metadata = self.loadSessionMetadata()
+            if !q.isEmpty {
+                // Titles live outside the message index and may change without a log append.
+                // Scan every session before limiting results so older title-only hits remain searchable.
+                let titleSQL = "SELECT m.id,m.source,m.project,m.role,m.body,m.file,m.stamp,f.started,f.updated,f.turn_active FROM messages m JOIN files f ON f.path=m.file WHERE m.id IN (SELECT max(id) FROM messages GROUP BY file)"
+                if let titles = self.prepare(titleSQL, db: db) {
+                    let existing = Set(hits.map(\.path))
+                    while sqlite3_step(titles) == SQLITE_ROW {
+                        func col(_ n: Int32) -> String { guard let p = sqlite3_column_text(titles, n) else { return "" }; return String(cString: p) }
+                        let hit = Hit(id: sqlite3_column_int64(titles, 0), source: col(1), project: col(2), role: col(3), text: col(4), path: col(5), timestamp: col(6), started: sqlite3_column_double(titles, 7), updated: sqlite3_column_double(titles, 8), turnActive: sqlite3_column_int(titles, 9) != 0)
+                        if !existing.contains(hit.path),
+                           let title = self.externalTitle(hit, metadata: metadata),
+                           title.range(of: q, options: .caseInsensitive) != nil { hits.append(hit) }
                     }
-                    sqlite3_finalize(fuzzy)
-                    extras.sort { $0.1 == $1.1 ? $0.0.id > $1.0.id : $0.1 > $1.1 }
-                    hits.append(contentsOf: extras.prefix(max(0, 80 - hits.count)).map(\.0))
+                    sqlite3_finalize(titles)
                 }
             }
-            self.enrich(&hits, db: db)
+            self.enrich(&hits, db: db, metadata: metadata)
             var seenFiles = Set<String>()
             hits = hits.filter { seenFiles.insert($0.path).inserted }
             hits.sort {
                 $0.started == $1.started ? $0.id > $1.id : $0.started > $1.started
             }
-            completion(hits)
+            completion(Array(hits.prefix(q.isEmpty ? 80 : 120)))
         }
     }
 }
 
 @MainActor final class Model: ObservableObject {
-    @Published var query = "" { didSet { highlightedID = nil; listRevision += 1; search() } }
+    @Published var query = "" { didSet { selected = nil; highlightedID = nil; listRevision += 1; search() } }
     @Published var listRevision = 0
     @Published var results: [Hit] = []
     @Published var highlightedID: Int64?
@@ -661,6 +674,22 @@ struct SearchView: View {
     private let raised = Color(red: 0.18, green: 0.18, blue: 0.19)
     private let muted = Color.white.opacity(0.52)
     private func accent(_ hit: Hit) -> Color { hit.source == "Claude" ? Color(red: 1, green: 0.59, blue: 0.35) : Color(red: 0.42, green: 0.75, blue: 1) }
+    private var searchPhrase: String { model.query.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private func highlighted(_ value: String) -> Text {
+        var result = AttributedString(value)
+        guard !searchPhrase.isEmpty else { return Text(result) }
+        var start = value.startIndex
+        while start < value.endIndex,
+              let range = value.range(of: searchPhrase, options: .caseInsensitive, range: start..<value.endIndex) {
+            if let lower = AttributedString.Index(range.lowerBound, within: result),
+               let upper = AttributedString.Index(range.upperBound, within: result) {
+                result[lower..<upper].foregroundColor = .yellow
+                result[lower..<upper].backgroundColor = .yellow.opacity(0.16)
+            }
+            start = range.upperBound
+        }
+        return Text(result)
+    }
     private func date(_ value: Double) -> String {
         guard value > 0 else { return "" }
         let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX")
@@ -691,7 +720,7 @@ struct SearchView: View {
             }
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 8) {
-                    Text(hit.title)
+                    highlighted(hit.title)
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.96))
                         .lineLimit(1)
@@ -706,7 +735,7 @@ struct SearchView: View {
                 HStack(spacing: 6) {
                     Text(hit.source).foregroundStyle(accent(hit))
                     Text("·")
-                    Text(hit.displayProject).lineLimit(1)
+                    highlighted(hit.displayProject).lineLimit(1)
                     if !hit.github.isEmpty {
                         Text("·")
                         Text(hit.github.map(\.label).joined(separator: ", ")).lineLimit(1)
@@ -714,6 +743,13 @@ struct SearchView: View {
                 }
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(muted)
+                if !searchPhrase.isEmpty {
+                    highlighted(hit.teaser(searchPhrase))
+                        .font(.system(size: 11))
+                        .foregroundStyle(muted)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
             }
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 7) {
@@ -731,7 +767,7 @@ struct SearchView: View {
             .help("Preview conversation")
         }
         .padding(.horizontal, 13)
-        .frame(height: 64)
+        .frame(height: searchPhrase.isEmpty ? 64 : 84)
         .frame(maxWidth: .infinity)
         .background(model.highlightedID == hit.id ? raised : hoveredID == hit.id ? Color.white.opacity(0.06) : .clear, in: RoundedRectangle(cornerRadius: 9))
         .contentShape(Rectangle())
@@ -782,11 +818,11 @@ struct SearchView: View {
                         Spacer()
                         statusLabel(hit)
                     }
-                    Text(hit.title).font(.system(size: 20, weight: .semibold)).lineLimit(2)
+                    highlighted(hit.title).font(.system(size: 20, weight: .semibold)).lineLimit(2)
                     Text("\(hit.source) · \(hit.displayProject) · Started \(date(hit.started))")
                         .font(.system(size: 11)).foregroundStyle(muted)
                     ScrollView {
-                        Text(hit.text).font(.system(size: 13)).textSelection(.enabled)
+                        highlighted(hit.text).font(.system(size: 13)).textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading).padding(16)
                     }
                     .background(raised, in: RoundedRectangle(cornerRadius: 10))
@@ -850,15 +886,34 @@ final class SearchPanel: NSPanel {
     }
 }
 
+@MainActor private final class UnreadBadgeView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.systemOrange.setFill()
+        NSBezierPath(ovalIn: bounds).fill()
+    }
+}
+
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = Model()
     var panel: SearchPanel!
     var status: NSStatusItem!
     var hotKey: EventHotKeyRef?
+    private let unreadBadge = UnreadBadgeView()
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         status.button?.image = NSImage(systemSymbolName: "sparkle.magnifyingglass", accessibilityDescription: "SessionSpot")
+        if let button = status.button {
+            unreadBadge.translatesAutoresizingMaskIntoConstraints = false
+            button.addSubview(unreadBadge)
+            NSLayoutConstraint.activate([
+                unreadBadge.widthAnchor.constraint(equalToConstant: 5),
+                unreadBadge.heightAnchor.constraint(equalToConstant: 5),
+                unreadBadge.centerXAnchor.constraint(equalTo: button.centerXAnchor, constant: 6),
+                unreadBadge.topAnchor.constraint(equalTo: button.centerYAnchor, constant: -8)
+            ])
+        }
         status.button?.target = self; status.button?.action = #selector(toggle)
         model.onUnreadChanged = { [weak self] count in self?.updateUnreadIndicator(count) }
         updateUnreadIndicator(model.unreadPaths.count)
@@ -886,15 +941,14 @@ final class SearchPanel: NSPanel {
     }
     @objc func refresh() { model.store.refresh() }
     private func updateUnreadIndicator(_ count: Int) {
-        status.length = count > 0 ? NSStatusItem.variableLength : NSStatusItem.squareLength
-        status.button?.attributedTitle = count > 0
-            ? NSAttributedString(string: " ●", attributes: [.foregroundColor: NSColor.systemOrange, .font: NSFont.systemFont(ofSize: 12)])
-            : NSAttributedString(string: "")
+        status.length = NSStatusItem.squareLength
+        unreadBadge.isHidden = count == 0
         status.button?.toolTip = count == 0 ? "No unread sessions" : "\(count) unread session\(count == 1 ? "" : "s")"
     }
     @objc func quit() { NSApp.terminate(nil) }
 }
 
+#if !TESTING
 @main @MainActor struct SessionSpotMain {
     static func main() {
         let app = NSApplication.shared
@@ -903,3 +957,5 @@ final class SearchPanel: NSPanel {
         app.run()
     }
 }
+
+#endif
