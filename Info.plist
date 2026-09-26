@@ -6,6 +6,8 @@
 	<string>ccs</string>
 	<key>CFBundleExecutable</key>
 	<string>ccs</string>
+	<key>CFBundleIconFile</key>
+	<string>ccs.icns</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.ccs.app</string>
 	<key>CFBundleName</key>
