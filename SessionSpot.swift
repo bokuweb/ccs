@@ -659,17 +659,27 @@ final class Store {
 
     func moveSelection(_ offset: Int) {
         guard !results.isEmpty else { highlightedID = nil; return }
-        selected = nil
+        if selected != nil { selected = nil }
         let index = results.firstIndex(where: { $0.id == highlightedID }) ?? 0
-        highlightedID = results[min(max(index + offset, 0), results.count - 1)].id
+        let nextID = results[min(max(index + offset, 0), results.count - 1)].id
+        if highlightedID != nextID { highlightedID = nextID }
     }
 
+}
+
+private struct ResultRowFrames: PreferenceKey {
+    static var defaultValue: [Int64: CGRect] = [:]
+
+    static func reduce(value: inout [Int64: CGRect], nextValue: () -> [Int64: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
 }
 
 struct SearchView: View {
     @ObservedObject var model: Model
     @FocusState private var focus: Bool
     @State private var hoveredID: Int64?
+    @State private var resultRowFrames: [Int64: CGRect] = [:]
     private let surface = Color(red: 0.105, green: 0.106, blue: 0.115)
     private let raised = Color(red: 0.18, green: 0.18, blue: 0.19)
     private let muted = Color.white.opacity(0.52)
@@ -770,6 +780,12 @@ struct SearchView: View {
         .frame(height: searchPhrase.isEmpty ? 64 : 84)
         .frame(maxWidth: .infinity)
         .background(model.highlightedID == hit.id ? raised : hoveredID == hit.id ? Color.white.opacity(0.06) : .clear, in: RoundedRectangle(cornerRadius: 9))
+        .background {
+            GeometryReader { geometry in
+                Color.clear.preference(key: ResultRowFrames.self,
+                                       value: [hit.id: geometry.frame(in: .named("results"))])
+            }
+        }
         .contentShape(Rectangle())
         .onHover { hoveredID = $0 ? hit.id : nil }
         .onTapGesture { model.openSession(hit) }
@@ -835,18 +851,33 @@ struct SearchView: View {
                 .padding(.horizontal, 22)
                 .padding(.bottom, 14)
             } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(spacing: 2) {
-                            ForEach(model.results) { hit in sessionRow(hit).id(hit.id) }
+                GeometryReader { viewport in
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(spacing: 2) {
+                                ForEach(model.results) { hit in sessionRow(hit).id(hit.id) }
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.bottom, 10)
                         }
-                        .padding(.horizontal, 14)
-                        .padding(.bottom, 10)
-                    }
-                    .id(model.listRevision)
-                    .onChange(of: model.highlightedID) { _, id in
-                        guard let id else { return }
-                        withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(id, anchor: .center) }
+                        .coordinateSpace(name: "results")
+                        .id(model.listRevision)
+                        .onPreferenceChange(ResultRowFrames.self) { resultRowFrames = $0 }
+                        .onChange(of: model.highlightedID) { previousID, id in
+                            guard let id else { return }
+                            guard let frame = resultRowFrames[id] else {
+                                guard let previousID,
+                                      let previousIndex = model.results.firstIndex(where: { $0.id == previousID }),
+                                      let nextIndex = model.results.firstIndex(where: { $0.id == id }) else { return }
+                                proxy.scrollTo(id, anchor: nextIndex > previousIndex ? .bottom : .top)
+                                return
+                            }
+                            if frame.minY < 0 {
+                                proxy.scrollTo(id, anchor: .top)
+                            } else if frame.maxY > viewport.size.height {
+                                proxy.scrollTo(id, anchor: .bottom)
+                            }
+                        }
                     }
                 }
             }
