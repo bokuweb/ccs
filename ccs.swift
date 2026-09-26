@@ -48,9 +48,38 @@ struct GitHubRef: Hashable {
     let label: String
 }
 
-@MainActor enum ProviderLogos {
-    static let claude = Bundle.main.image(forResource: "ClaudeLogo")
-    static let codex = Bundle.main.image(forResource: "CodexLogo")
+private struct ProviderLogo: View {
+    let source: String
+
+    var body: some View {
+        ZStack {
+            if source == "Claude" {
+                ForEach(0..<12, id: \.self) { ray in
+                    Capsule()
+                        .fill(Color(red: 0.96, green: 0.55, blue: 0.39))
+                        .frame(width: 2.5, height: 11)
+                        .offset(y: -4.5)
+                        .rotationEffect(.degrees(Double(ray) * 30))
+                }
+            } else {
+                Image(systemName: "cloud.fill")
+                    .resizable()
+                    .scaledToFit()
+                    .foregroundStyle(LinearGradient(colors: [Color(red: 0.67, green: 0.57, blue: 1), Color(red: 0.13, green: 0.45, blue: 1)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                Path { path in
+                    path.move(to: CGPoint(x: 6.2, y: 7.3))
+                    path.addLine(to: CGPoint(x: 9.3, y: 10))
+                    path.addLine(to: CGPoint(x: 6.2, y: 12.7))
+                    path.move(to: CGPoint(x: 10.6, y: 12.7))
+                    path.addLine(to: CGPoint(x: 15.2, y: 12.7))
+                }
+                .stroke(.white, style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
+            }
+        }
+        .frame(width: 20, height: 20)
+        .scaleEffect(0.8)
+        .accessibilityLabel(source)
+    }
 }
 
 final class Store {
@@ -181,8 +210,17 @@ final class Store {
             if let value = sqlite3_column_text(statement, 0) { paths.insert(String(cString: value)) }
         }
         sqlite3_finalize(statement)
+        if !UserDefaults.standard.bool(forKey: "includeArchived") {
+            let metadata = loadSessionMetadata()
+            paths = paths.filter { path in
+                let source = path.contains("/.claude/") ? "Claude" : "Codex"
+                let hit = Hit(id: 0, source: source, project: "", role: "", text: "", path: path, timestamp: "", started: 0, updated: 0, turnActive: false)
+                return !isArchived(hit, metadata: metadata)
+            }
+        }
         onUnreadPaths?(paths)
     }
+    func refreshUnreadPaths() { queue.async { [weak self] in self?.publishUnreadPaths() } }
     func markRead(_ path: String) {
         queue.async { [weak self] in
             guard let self else { return }
@@ -359,10 +397,12 @@ final class Store {
     private struct SessionMetadata {
         var codex: [String: (String, Double)]
         var claude: [String: [String: Any]]
+        var archivedCodex: Set<String>
     }
     private func loadSessionMetadata() -> SessionMetadata {
         var codex: [String: (String, Double)] = [:]
         var claude: [String: [String: Any]] = [:]
+        var archivedCodex = Set<String>()
         let claudeRoot = metadataHome.appendingPathComponent("Library/Application Support/Claude/claude-code-sessions")
         if let files = FileManager.default.enumerator(at: claudeRoot, includingPropertiesForKeys: nil) {
             for case let url as URL in files where url.pathExtension == "json" {
@@ -375,16 +415,25 @@ final class Store {
         let state = metadataHome.appendingPathComponent(".codex/state_5.sqlite").path
         var stateDB: OpaquePointer?
         if sqlite3_open_v2(state, &stateDB, SQLITE_OPEN_READONLY, nil) == SQLITE_OK {
-            if let stmt = prepare("SELECT id,COALESCE(NULLIF(name,''),title),created_at FROM threads", db: stateDB) {
+            let currentSQL = "SELECT id,COALESCE(NULLIF(name,''),title),created_at,archived FROM threads"
+            let stmt = prepare(currentSQL, db: stateDB) ?? prepare("SELECT id,COALESCE(NULLIF(name,''),title),created_at,0 FROM threads", db: stateDB)
+            if let stmt {
                 while sqlite3_step(stmt) == SQLITE_ROW {
-                    guard let id = sqlite3_column_text(stmt, 0), let title = sqlite3_column_text(stmt, 1) else { continue }
-                    codex[String(cString: id)] = (String(cString: title), Double(sqlite3_column_int64(stmt, 2)))
+                    guard let id = sqlite3_column_text(stmt, 0) else { continue }
+                    let sessionID = String(cString: id)
+                    let title = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+                    codex[sessionID] = (title, Double(sqlite3_column_int64(stmt, 2)))
+                    if sqlite3_column_int(stmt, 3) != 0 { archivedCodex.insert(sessionID) }
                 }
                 sqlite3_finalize(stmt)
             }
         }
         if stateDB != nil { sqlite3_close(stateDB) }
-        return SessionMetadata(codex: codex, claude: claude)
+        return SessionMetadata(codex: codex, claude: claude, archivedCodex: archivedCodex)
+    }
+    private func isArchived(_ hit: Hit, metadata: SessionMetadata) -> Bool {
+        if hit.source == "Claude" { return metadata.claude[hit.sessionID]?["isArchived"] as? Bool == true }
+        return hit.path.contains("/.codex/archived_sessions/") || metadata.archivedCodex.contains(hit.sessionID)
     }
     private func externalTitle(_ hit: Hit, metadata: SessionMetadata) -> String? {
         if hit.source == "Codex" { return metadata.codex[hit.sessionID]?.0 }
@@ -450,7 +499,7 @@ final class Store {
         }
         sqlite3_finalize(first); sqlite3_finalize(links)
     }
-    func query(_ phrase: String, completion: @escaping ([Hit]) -> Void) {
+    func query(_ phrase: String, includeArchived: Bool = false, completion: @escaping ([Hit]) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             var db: OpaquePointer?
             guard sqlite3_open_v2(self.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { completion([]); return }
@@ -459,11 +508,11 @@ final class Store {
             let order = "f.started DESC,f.updated DESC"
             let sql: String
             if q.isEmpty {
-                sql = "SELECT m.id,m.source,m.project,m.role,m.body,m.file,m.stamp,f.started,f.updated,f.turn_active FROM messages m JOIN files f ON f.path=m.file WHERE m.id IN (SELECT max(id) FROM messages GROUP BY file) ORDER BY \(order),m.id DESC LIMIT 80"
+                sql = "SELECT m.id,m.source,m.project,m.role,m.body,m.file,m.stamp,f.started,f.updated,f.turn_active FROM messages m JOIN files f ON f.path=m.file WHERE m.id IN (SELECT max(id) FROM messages GROUP BY file) ORDER BY \(order),m.id DESC"
             } else if q.count >= 3 {
-                sql = "SELECT m.id,m.source,m.project,m.role,m.body,m.file,m.stamp,f.started,f.updated,f.turn_active FROM messages m JOIN files f ON f.path=m.file WHERE m.id IN (SELECT max(m2.id) FROM search s JOIN messages m2 ON m2.id=s.rowid WHERE s.body LIKE ? ESCAPE '\\' GROUP BY m2.file) ORDER BY \(order),m.id DESC LIMIT 120"
+                sql = "SELECT m.id,m.source,m.project,m.role,m.body,m.file,m.stamp,f.started,f.updated,f.turn_active FROM messages m JOIN files f ON f.path=m.file WHERE m.id IN (SELECT max(m2.id) FROM search s JOIN messages m2 ON m2.id=s.rowid WHERE s.body LIKE ? ESCAPE '\\' GROUP BY m2.file) ORDER BY \(order),m.id DESC"
             } else {
-                sql = "SELECT m.id,m.source,m.project,m.role,m.body,m.file,m.stamp,f.started,f.updated,f.turn_active FROM messages m JOIN files f ON f.path=m.file WHERE m.id IN (SELECT max(m2.id) FROM messages m2 WHERE m2.body LIKE ? ESCAPE '\\' GROUP BY m2.file) ORDER BY \(order),m.id DESC LIMIT 120"
+                sql = "SELECT m.id,m.source,m.project,m.role,m.body,m.file,m.stamp,f.started,f.updated,f.turn_active FROM messages m JOIN files f ON f.path=m.file WHERE m.id IN (SELECT max(m2.id) FROM messages m2 WHERE m2.body LIKE ? ESCAPE '\\' GROUP BY m2.file) ORDER BY \(order),m.id DESC"
             }
             guard let st = self.prepare(sql, db: db) else { completion([]); return }
             if !q.isEmpty { self.bind(st, 1, "%" + q.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_") + "%") }
@@ -474,7 +523,7 @@ final class Store {
             }
             sqlite3_finalize(st)
             if !q.isEmpty {
-                if let byProject = self.prepare("SELECT m.id,m.source,m.project,m.role,m.body,m.file,m.stamp,f.started,f.updated,f.turn_active FROM messages m JOIN files f ON f.path=m.file WHERE m.id IN (SELECT max(id) FROM messages WHERE project LIKE ? ESCAPE '\\' GROUP BY file) ORDER BY \(order),m.id DESC LIMIT 60", db: db) {
+                if let byProject = self.prepare("SELECT m.id,m.source,m.project,m.role,m.body,m.file,m.stamp,f.started,f.updated,f.turn_active FROM messages m JOIN files f ON f.path=m.file WHERE m.id IN (SELECT max(id) FROM messages WHERE project LIKE ? ESCAPE '\\' GROUP BY file) ORDER BY \(order),m.id DESC", db: db) {
                     self.bind(byProject, 1, "%" + q.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_") + "%")
                     var seen = Set(hits.map(\.id))
                     while sqlite3_step(byProject) == SQLITE_ROW {
@@ -502,12 +551,13 @@ final class Store {
                     sqlite3_finalize(titles)
                 }
             }
+            if !includeArchived { hits.removeAll { self.isArchived($0, metadata: metadata) } }
             self.enrich(&hits, db: db, metadata: metadata)
-            var seenFiles = Set<String>()
-            hits = hits.filter { seenFiles.insert($0.path).inserted }
             hits.sort {
                 $0.started == $1.started ? $0.id > $1.id : $0.started > $1.started
             }
+            var seenSessions = Set<String>()
+            hits = hits.filter { seenSessions.insert("\($0.source):\($0.sessionID)").inserted }
             completion(Array(hits.prefix(q.isEmpty ? 80 : 120)))
         }
     }
@@ -515,6 +565,14 @@ final class Store {
 
 @MainActor final class Model: ObservableObject {
     @Published var query = "" { didSet { selected = nil; highlightedID = nil; listRevision += 1; search() } }
+    @Published var includeArchived = UserDefaults.standard.bool(forKey: "includeArchived") {
+        didSet {
+            UserDefaults.standard.set(includeArchived, forKey: "includeArchived")
+            selected = nil; highlightedID = nil; listRevision += 1
+            search()
+            store.refreshUnreadPaths()
+        }
+    }
     @Published var listRevision = 0
     @Published var results: [Hit] = []
     @Published var highlightedID: Int64?
@@ -664,7 +722,7 @@ final class Store {
     func search() {
         generation += 1
         let current = generation
-        store.query(query) { [weak self] hits in
+        store.query(query, includeArchived: includeArchived) { [weak self] hits in
             DispatchQueue.main.async {
                 guard let self, current == self.generation else { return }
                 self.results = hits
@@ -745,12 +803,7 @@ struct SearchView: View {
     }
     private func sessionRow(_ hit: Hit) -> some View {
         HStack(alignment: .center, spacing: 12) {
-            if let logo = hit.source == "Claude" ? ProviderLogos.claude : ProviderLogos.codex {
-                Image(nsImage: logo)
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: 20, height: 20)
-            }
+            ProviderLogo(source: hit.source)
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 8) {
                     highlighted(hit.title)
@@ -1053,7 +1106,7 @@ private enum MenuBarIcon {
             window.title = "ccs Settings"; window.isReleasedWhenClosed = false
             window.center(); settingsWindow = window
         }
-        settingsWindow?.contentView = NSHostingView(rootView: SettingsView(settings: settings, accounts: accounts, tab: tab))
+        settingsWindow?.contentView = NSHostingView(rootView: SettingsView(settings: settings, accounts: accounts, search: model, tab: tab))
         settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }

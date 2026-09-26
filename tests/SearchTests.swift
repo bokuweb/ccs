@@ -32,8 +32,8 @@ import SQLite3
         let claudeRoot = directory.appendingPathComponent("Library/Application Support/Claude/claude-code-sessions")
         try! FileManager.default.createDirectory(at: claudeRoot, withIntermediateDirectories: true)
         let claudeFile = claudeRoot.appendingPathComponent("session.json")
-        func writeClaudeTitle(_ title: String) {
-            try! JSONSerialization.data(withJSONObject: ["cliSessionId": "fixture-20", "title": title, "sessionId": "desktop-20"]).write(to: claudeFile)
+        func writeClaudeTitle(_ title: String, archived: Bool = false) {
+            try! JSONSerialization.data(withJSONObject: ["cliSessionId": "fixture-20", "title": title, "sessionId": "desktop-20", "isArchived": archived]).write(to: claudeFile)
         }
         writeClaudeTitle("モデル選択ロゴ表示とClaude表示バグ")
         let custom = directory.appendingPathComponent("fixture-21")
@@ -43,11 +43,11 @@ import SQLite3
         try! FileManager.default.createDirectory(at: codexRoot, withIntermediateDirectories: true)
         var state: OpaquePointer?
         precondition(sqlite3_open(codexRoot.appendingPathComponent("state_5.sqlite").path, &state) == SQLITE_OK)
-        exec("CREATE TABLE threads(id TEXT, name TEXT, title TEXT, created_at REAL); INSERT INTO threads VALUES('fixture-22','Codex表示バグ','old title',22),('fixture-23','','表示バグ',23);", on: state)
+        exec("CREATE TABLE threads(id TEXT, name TEXT, title TEXT, created_at REAL, archived INTEGER NOT NULL DEFAULT 0); INSERT INTO threads VALUES('fixture-22','Codex表示バグ','old title',22,0),('fixture-23','','表示バグ',23,0);", on: state)
         defer { sqlite3_close(db); sqlite3_close(state) }
-        func check(_ phrase: String, _ ids: Set<Int64>, verify: @escaping ([Hit]) -> Void = { _ in }) {
+        func check(_ phrase: String, _ ids: Set<Int64>, includeArchived: Bool = false, verify: @escaping ([Hit]) -> Void = { _ in }) {
             let done = DispatchSemaphore(value: 0)
-            store.query(phrase) { hits in
+            store.query(phrase, includeArchived: includeArchived) { hits in
                 precondition(Set(hits.map(\.id)) == ids, "Unexpected results for \(phrase): \(hits.map(\.id))")
                 precondition(Set(hits.map(\.path)).count == hits.count)
                 precondition(hits.map(\.started) == hits.map(\.started).sorted(by: >))
@@ -82,9 +82,27 @@ import SQLite3
         check("表示バグ", [21,23])
         check("改名後", [20])
         check("renamed", [22])
+        // Archive state changes should apply without reindexing, including title-only matches.
+        writeClaudeTitle("改名後のタイトル", archived: true)
+        exec("UPDATE threads SET archived=1 WHERE id='fixture-22'", on: state)
+        let archivedFile = codexRoot.appendingPathComponent("archived_sessions/fixture-30.jsonl").path
+        exec("INSERT INTO files(path,offset,size,started) VALUES('\(archivedFile)',0,0,30); INSERT INTO messages(id,file,source,project,role,body,stamp) VALUES(30,'\(archivedFile)','Codex','/projects/sample','user','archived marker',''); INSERT INTO search(rowid,body) VALUES(30,'archived marker');")
+        check("改名後", [])
+        check("改名後", [20], includeArchived: true)
+        check("renamed", [])
+        check("renamed", [22], includeArchived: true)
+        check("archived marker", [])
+        check("archived marker", [30], includeArchived: true)
         // A title-only result older than the normal recent/search limits must still be found.
         for id in 100...230 { add(id) }
-        check("改名後", [20])
+        check("改名後", [20], includeArchived: true)
+        // Archived recent hits must not consume the visible result limit.
+        for id in 231...310 {
+            add(id)
+            exec("INSERT INTO threads VALUES('fixture-\(id)','','',\(id),1)", on: state)
+        }
+        check("", Set(Int64(151)...Int64(230)))
+        check("unrelated", Set(Int64(111)...Int64(230)))
         let body = "編集テストは「戻る」の遷移完了前に、残っていた編集画面を操作していました。プレビューと編集画面のURL・表示状態を待つように直します。新規作成後の再読み込みも、エディタの初期化完了を待ってから保存内容を検証します。"
         var hit = Hit(id: 1, source: "Codex", project: "/projects/hidden/表示/project", role: "assistant", text: body, path: "test", timestamp: "", started: 0, updated: 0, turnActive: false)
         precondition(hit.teaser("表示").hasPrefix("…表示状態"))
