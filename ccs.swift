@@ -57,7 +57,7 @@ final class Store {
     let path: String
     private let metadataHome: URL
     private var writer: OpaquePointer?
-    private let queue = DispatchQueue(label: "sessionspot.index", qos: .utility)
+    private let queue = DispatchQueue(label: "ccs.index", qos: .utility)
     private var indexing = false
     private var repaired = false
     var onStatus: ((String) -> Void)?
@@ -65,9 +65,32 @@ final class Store {
 
     init(databasePath: String? = nil, metadataHome: URL = FileManager.default.homeDirectoryForCurrentUser) {
         self.metadataHome = metadataHome
-        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/SessionSpot")
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let dir = home.appendingPathComponent("Library/Application Support/ccs")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         path = databasePath ?? dir.appendingPathComponent("index.sqlite3").path
+        if databasePath == nil && !FileManager.default.fileExists(atPath: path) {
+            let oldPath = home.appendingPathComponent("Library/Application Support/SessionSpot/index.sqlite3").path
+            if FileManager.default.fileExists(atPath: oldPath) {
+                var source: OpaquePointer?
+                var destination: OpaquePointer?
+                var copied = false
+                if sqlite3_open_v2(oldPath, &source, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+                   sqlite3_open(path, &destination) == SQLITE_OK,
+                   let backup = sqlite3_backup_init(destination, "main", source, "main") {
+                    var result = sqlite3_backup_step(backup, -1)
+                    for _ in 0..<5 where result == SQLITE_BUSY || result == SQLITE_LOCKED {
+                        sqlite3_sleep(100)
+                        result = sqlite3_backup_step(backup, -1)
+                    }
+                    copied = result == SQLITE_DONE
+                    sqlite3_backup_finish(backup)
+                }
+                sqlite3_close(source)
+                sqlite3_close(destination)
+                if !copied { try? FileManager.default.removeItem(atPath: path) }
+            }
+        }
         sqlite3_open(path, &writer)
         exec("PRAGMA journal_mode=WAL")
         exec("PRAGMA synchronous=NORMAL")
@@ -578,7 +601,7 @@ final class Store {
         }
         let address: String
         if let desktopID = hit.desktopID, hit.source == "Claude" {
-            address = "claude://code/continue?session=\(desktopID)&source=sessionspot"
+            address = "claude://code/continue?session=\(desktopID)&source=ccs"
         } else {
             address = "codex://threads/\(hit.sessionID)"
         }
@@ -659,17 +682,27 @@ final class Store {
 
     func moveSelection(_ offset: Int) {
         guard !results.isEmpty else { highlightedID = nil; return }
-        selected = nil
+        if selected != nil { selected = nil }
         let index = results.firstIndex(where: { $0.id == highlightedID }) ?? 0
-        highlightedID = results[min(max(index + offset, 0), results.count - 1)].id
+        let nextID = results[min(max(index + offset, 0), results.count - 1)].id
+        if highlightedID != nextID { highlightedID = nextID }
     }
 
 }
 
+private struct ResultRowFrames: PreferenceKey {
+    static var defaultValue: [Int64: CGRect] = [:]
+
+    static func reduce(value: inout [Int64: CGRect], nextValue: () -> [Int64: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
 struct SearchView: View {
     @ObservedObject var model: Model
+    var openSettings: (Int) -> Void
     @FocusState private var focus: Bool
-    @State private var hoveredID: Int64?
+    @State private var resultRowFrames: [Int64: CGRect] = [:]
     private let surface = Color(red: 0.105, green: 0.106, blue: 0.115)
     private let raised = Color(red: 0.18, green: 0.18, blue: 0.19)
     private let muted = Color.white.opacity(0.52)
@@ -716,12 +749,12 @@ struct SearchView: View {
                 Image(nsImage: logo)
                     .resizable()
                     .interpolation(.high)
-                    .frame(width: 36, height: 36)
+                    .frame(width: 20, height: 20)
             }
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 8) {
                     highlighted(hit.title)
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(.white.opacity(0.96))
                         .lineLimit(1)
                     if model.unreadPaths.contains(hit.path) {
@@ -767,11 +800,16 @@ struct SearchView: View {
             .help("Preview conversation")
         }
         .padding(.horizontal, 13)
-        .frame(height: searchPhrase.isEmpty ? 64 : 84)
+        .frame(height: searchPhrase.isEmpty ? 52 : 68)
         .frame(maxWidth: .infinity)
-        .background(model.highlightedID == hit.id ? raised : hoveredID == hit.id ? Color.white.opacity(0.06) : .clear, in: RoundedRectangle(cornerRadius: 9))
+        .background(model.highlightedID == hit.id ? raised : .clear, in: RoundedRectangle(cornerRadius: 9))
+        .background {
+            GeometryReader { geometry in
+                Color.clear.preference(key: ResultRowFrames.self,
+                                       value: [hit.id: geometry.frame(in: .named("results"))])
+            }
+        }
         .contentShape(Rectangle())
-        .onHover { hoveredID = $0 ? hit.id : nil }
         .onTapGesture { model.openSession(hit) }
         .contextMenu {
             Button("Preview conversation") { model.preview(hit) }
@@ -785,16 +823,16 @@ struct SearchView: View {
         VStack(spacing: 0) {
             HStack(spacing: 14) {
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: 21, weight: .regular))
+                    .font(.system(size: 17, weight: .regular))
                     .foregroundStyle(.white.opacity(0.55))
                 TextField("Search sessions and conversations…", text: $model.query)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 22, weight: .regular))
+                    .font(.system(size: 18, weight: .regular))
                     .focused($focus)
                     .onSubmit { if let hit = model.highlightedHit { model.openSession(hit) } }
             }
-            .padding(.horizontal, 24)
-            .frame(height: 76)
+            .padding(.horizontal, 18)
+            .frame(height: 58)
             Divider().overlay(.white.opacity(0.05))
             HStack(spacing: 8) {
                 Text(model.query.isEmpty ? "Recent sessions" : "Search results")
@@ -808,8 +846,8 @@ struct SearchView: View {
             }
             .font(.system(size: 11))
             .foregroundStyle(muted)
-            .padding(.horizontal, 25)
-            .frame(height: 42)
+            .padding(.horizontal, 20)
+            .frame(height: 32)
             if let hit = model.selected {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack {
@@ -835,18 +873,33 @@ struct SearchView: View {
                 .padding(.horizontal, 22)
                 .padding(.bottom, 14)
             } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(spacing: 2) {
-                            ForEach(model.results) { hit in sessionRow(hit).id(hit.id) }
+                GeometryReader { viewport in
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(spacing: 2) {
+                                ForEach(model.results) { hit in sessionRow(hit).id(hit.id) }
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.bottom, 10)
                         }
-                        .padding(.horizontal, 14)
-                        .padding(.bottom, 10)
-                    }
-                    .id(model.listRevision)
-                    .onChange(of: model.highlightedID) { _, id in
-                        guard let id else { return }
-                        withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(id, anchor: .center) }
+                        .coordinateSpace(name: "results")
+                        .id(model.listRevision)
+                        .onPreferenceChange(ResultRowFrames.self) { resultRowFrames = $0 }
+                        .onChange(of: model.highlightedID) { previousID, id in
+                            guard let id else { return }
+                            guard let frame = resultRowFrames[id] else {
+                                guard let previousID,
+                                      let previousIndex = model.results.firstIndex(where: { $0.id == previousID }),
+                                      let nextIndex = model.results.firstIndex(where: { $0.id == id }) else { return }
+                                proxy.scrollTo(id, anchor: nextIndex > previousIndex ? .bottom : .top)
+                                return
+                            }
+                            if frame.minY < 0 {
+                                proxy.scrollTo(id, anchor: .top)
+                            } else if frame.maxY > viewport.size.height {
+                                proxy.scrollTo(id, anchor: .bottom)
+                            }
+                        }
                     }
                 }
             }
@@ -857,17 +910,19 @@ struct SearchView: View {
                 Text(model.status).lineLimit(1)
                 Spacer(minLength: 12)
                 Button("Refresh") { model.store.refresh() }.buttonStyle(.plain)
-                Button("Quit") { NSApp.terminate(nil) }.buttonStyle(.plain)
+                Button("Accounts") { openSettings(1) }.buttonStyle(.plain)
+                Button { openSettings(0) } label: { Image(systemName: "gearshape") }.buttonStyle(.plain).help("Settings (⌘,)").keyboardShortcut(",", modifiers: .command)
                 Text("Open  ↵")
                     .foregroundStyle(.white.opacity(0.8))
             }
             .font(.system(size: 11, weight: .medium))
             .foregroundStyle(muted)
             .padding(.horizontal, 21)
-            .frame(height: 43)
+            .frame(height: 36)
             .background(Color.white.opacity(0.035))
         }
         .background(surface)
+        .ignoresSafeArea(.container, edges: .top)
         .onAppear { focus = true }
     }
 }
@@ -918,7 +973,7 @@ private enum MenuBarIcon {
             return true
         }
         image.isTemplate = true
-        image.accessibilityDescription = "SessionSpot"
+        image.accessibilityDescription = "ccs"
         return image
     }
 }
@@ -933,6 +988,9 @@ private enum MenuBarIcon {
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = Model()
+    let settings = SettingsModel()
+    let accounts = AccountsModel()
+    var settingsWindow: NSWindow?
     var panel: SearchPanel!
     var status: NSStatusItem!
     var hotKey: EventHotKeyRef?
@@ -954,23 +1012,50 @@ private enum MenuBarIcon {
         status.button?.target = self; status.button?.action = #selector(toggle)
         model.onUnreadChanged = { [weak self] count in self?.updateUnreadIndicator(count) }
         updateUnreadIndicator(model.unreadPaths.count)
-        panel = SearchPanel(contentRect: NSRect(x: 0, y: 0, width: 720, height: 580), styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
+        panel = SearchPanel(contentRect: NSRect(x: 0, y: 0, width: 660, height: 480), styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
         panel.titleVisibility = .hidden; panel.titlebarAppearsTransparent = true
         panel.isFloatingPanel = true; panel.level = .floating; panel.isReleasedWhenClosed = false
         panel.backgroundColor = NSColor(red: 0.105, green: 0.106, blue: 0.115, alpha: 1)
-        panel.contentView = NSHostingView(rootView: SearchView(model: model))
+        panel.contentView = NSHostingView(rootView: SearchView(model: model, openSettings: { [weak self] tab in self?.showSettings(tab: tab) }))
         panel.onMoveSelection = { [weak model] offset in model?.moveSelection(offset) }
         panel.center()
-        let id = EventHotKeyID(signature: OSType(0x53535054), id: 1)
-        RegisterEventHotKey(UInt32(kVK_Space), UInt32(cmdKey | shiftKey), id, GetApplicationEventTarget(), 0, &hotKey)
+        settings.register = { [weak self] shortcut in self?.registerShortcut(shortcut) ?? false }
+        if !registerShortcut(settings.shortcut) { settings.error = "Saved shortcut is unavailable. Choose another in Settings." }
+        let menu = NSMenu()
+        let appMenu = NSMenuItem(); menu.addItem(appMenu)
+        let submenu = NSMenu(); appMenu.submenu = submenu
+        submenu.addItem(withTitle: "Settings…", action: #selector(openGeneralSettings), keyEquivalent: ",").target = self
+        submenu.addItem(withTitle: "Quit ccs", action: #selector(quit), keyEquivalent: "q").target = self
+        NSApp.mainMenu = menu
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { _, _, userData in
             guard let userData else { return noErr }
             let delegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
-            DispatchQueue.main.async { delegate.toggle() }
+            DispatchQueue.main.async { if !delegate.settings.recording { delegate.toggle() } }
             return noErr
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
         toggle()
+    }
+    func registerShortcut(_ shortcut: AppShortcut) -> Bool {
+        if hotKey != nil && shortcut == settings.shortcut { return true }
+        var candidate: EventHotKeyRef?
+        let id = EventHotKeyID(signature: OSType(0x53535054), id: 1)
+        guard RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers, id, GetApplicationEventTarget(), 0, &candidate) == noErr else { return false }
+        if let hotKey { UnregisterEventHotKey(hotKey) }
+        hotKey = candidate
+        return true
+    }
+    @objc func openGeneralSettings() { showSettings(tab: 0) }
+    func showSettings(tab: Int) {
+        panel.orderOut(nil)
+        if settingsWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 470), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.title = "ccs Settings"; window.isReleasedWhenClosed = false
+            window.center(); settingsWindow = window
+        }
+        settingsWindow?.contentView = NSHostingView(rootView: SettingsView(settings: settings, accounts: accounts, tab: tab))
+        settingsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
     @objc func toggle() {
         if panel.isVisible { panel.orderOut(nil) }
@@ -986,7 +1071,7 @@ private enum MenuBarIcon {
 }
 
 #if !TESTING
-@main @MainActor struct SessionSpotMain {
+@main @MainActor struct CCSMain {
     static func main() {
         let app = NSApplication.shared
         let delegate = AppDelegate()
