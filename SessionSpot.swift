@@ -886,15 +886,34 @@ final class SearchPanel: NSPanel {
     }
 }
 
+@MainActor private final class UnreadBadgeView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.systemOrange.setFill()
+        NSBezierPath(ovalIn: bounds).fill()
+    }
+}
+
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = Model()
     var panel: SearchPanel!
     var status: NSStatusItem!
     var hotKey: EventHotKeyRef?
+    private let unreadBadge = UnreadBadgeView()
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         status.button?.image = NSImage(systemSymbolName: "sparkle.magnifyingglass", accessibilityDescription: "SessionSpot")
+        if let button = status.button {
+            unreadBadge.translatesAutoresizingMaskIntoConstraints = false
+            button.addSubview(unreadBadge)
+            NSLayoutConstraint.activate([
+                unreadBadge.widthAnchor.constraint(equalToConstant: 5),
+                unreadBadge.heightAnchor.constraint(equalToConstant: 5),
+                unreadBadge.centerXAnchor.constraint(equalTo: button.centerXAnchor, constant: 6),
+                unreadBadge.topAnchor.constraint(equalTo: button.centerYAnchor, constant: -8)
+            ])
+        }
         status.button?.target = self; status.button?.action = #selector(toggle)
         model.onUnreadChanged = { [weak self] count in self?.updateUnreadIndicator(count) }
         updateUnreadIndicator(model.unreadPaths.count)
@@ -922,10 +941,8 @@ final class SearchPanel: NSPanel {
     }
     @objc func refresh() { model.store.refresh() }
     private func updateUnreadIndicator(_ count: Int) {
-        status.length = count > 0 ? NSStatusItem.variableLength : NSStatusItem.squareLength
-        status.button?.attributedTitle = count > 0
-            ? NSAttributedString(string: " ●", attributes: [.foregroundColor: NSColor.systemOrange, .font: NSFont.systemFont(ofSize: 12)])
-            : NSAttributedString(string: "")
+        status.length = NSStatusItem.squareLength
+        unreadBadge.isHidden = count == 0
         status.button?.toolTip = count == 0 ? "No unread sessions" : "\(count) unread session\(count == 1 ? "" : "s")"
     }
     @objc func quit() { NSApp.terminate(nil) }
