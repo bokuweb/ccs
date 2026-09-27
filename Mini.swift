@@ -78,6 +78,12 @@ private struct MiniAccountRow: View {
     let account: SavedAccount
 
     private var isActive: Bool { model.active[account.provider] == account.id }
+    private var activeLabel: String {
+        if account.provider == .codex { return "CLI active" }
+        let profiles = ClaudeDesktopProfiles(repository: model.repository)
+        guard let accountUUID = profiles.accountUUID(account) else { return "Code active" }
+        return profiles.desktopUUID() == accountUUID ? "Active" : "Code active"
+    }
     private var usageStatus: String {
         guard let error = model.usage[account.id]?.error else { return "No usage" }
         return error.contains("HTTP 429") ? "Rate limited" : "Unavailable"
@@ -94,20 +100,18 @@ private struct MiniAccountRow: View {
                 HStack(spacing: 5) {
                     if isActive {
                         Circle().fill(MiniStyle.active).frame(width: 6, height: 6)
-                        Text(account.provider == .codex ? "CLI active" : "Active")
+                        Text(activeLabel)
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(MiniStyle.active)
                     }
-                    if !isActive || account.provider == .codex {
-                        Button(isActive ? "Restart Desktop" : "Switch") { model.activate(account, refreshUsage: false) }
-                            .font(.system(size: 10, weight: .medium))
-                            .buttonStyle(.plain)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(.white.opacity(0.07), in: Capsule())
-                            .overlay(Capsule().stroke(.white.opacity(0.13), lineWidth: 0.5))
-                            .disabled(account.provider == .codex && model.switchingCodex)
-                    }
+                    Button(isActive ? "Restart Desktop" : "Switch") { model.activate(account, refreshUsage: false) }
+                        .font(.system(size: 10, weight: .medium))
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(.white.opacity(0.07), in: Capsule())
+                        .overlay(Capsule().stroke(.white.opacity(0.13), lineWidth: 0.5))
+                        .disabled(model.switchingCodex || model.switchingClaude)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

@@ -71,6 +71,12 @@ final class MemoryVault: CredentialVault {
         assert(after["unrelatedSetting"] as? Bool == true)
         let fallback = try Data(contentsOf: root.appendingPathComponent(".claude/.credentials.json"))
         assert(fallback == claudeTwoSecret(repository, claudeTwo), "fallback and Keychain agree")
+        let refreshedClaude = try repository.encode(["claudeAiOauth": ["accessToken": "rotated-c2"]])
+        try vault.write(refreshedClaude, repository.claudeService(directory: nil), repository.user)
+        try repository.secureWrite(refreshedClaude, to: root.appendingPathComponent(".claude/.credentials.json"))
+        try repository.activate(claudeTwo, accounts: &accounts)
+        assert(tryRead(vault, repository) == refreshedClaude, "same-account restart keeps refreshed Claude token")
+        assert(claudeTwoSecret(repository, claudeTwo) == refreshedClaude, "refreshed Claude token is saved")
         // Fail the profile write after the Keychain change and verify rollback.
         vault.onWrite = { service in
             guard service == repository.claudeService(directory: nil) else { return }
@@ -82,13 +88,37 @@ final class MemoryVault: CredentialVault {
         do { try repository.activate(claudeOne, accounts: &accounts); fatalError("invalid profile accepted") } catch {}
         assert(tryRead(vault, repository) == oldKeychain)
         let restoredFallback = try Data(contentsOf: root.appendingPathComponent(".claude/.credentials.json"))
-        assert(restoredFallback == fallback, "failed switch restores fallback credentials")
+        assert(restoredFallback == refreshedClaude, "failed switch restores fallback credentials")
+        let desktopOneUUID = UUID().uuidString.lowercased()
+        let desktopTwoUUID = UUID().uuidString.lowercased()
+        let desktopOne = SavedAccount(id: UUID().uuidString, provider: .claude, identity: "\(desktopOneUUID):org", name: "first")
+        let desktopTwo = SavedAccount(id: UUID().uuidString, provider: .claude, identity: "\(desktopTwoUUID):org", name: "second")
+        let desktopProfiles = ClaudeDesktopProfiles(repository: repository)
+        try repository.secureWrite(repository.encode(["lastKnownAccountUuid": desktopOneUUID]), to: desktopProfiles.desktop.appendingPathComponent("config.json"))
+        try repository.secureWrite(Data("first-profile".utf8), to: desktopProfiles.desktop.appendingPathComponent("sentinel"))
+        let needsSignIn = try desktopProfiles.select(desktopTwo, accounts: [desktopOne, desktopTwo])
+        assert(!needsSignIn, "new Desktop login needs sign-in")
+        assert(desktopProfiles.selectedID() == desktopTwo.id)
+        let firstSaved = try String(contentsOf: desktopProfiles.profiles.appendingPathComponent("\(desktopOne.id)/sentinel"), encoding: .utf8)
+        assert(firstSaved == "first-profile")
+        try repository.secureWrite(repository.encode(["lastKnownAccountUuid": desktopTwoUUID]), to: desktopProfiles.desktop.appendingPathComponent("config.json"))
+        try repository.secureWrite(Data("second-profile".utf8), to: desktopProfiles.desktop.appendingPathComponent("sentinel"))
+        let restoredLogin = try desktopProfiles.select(desktopOne, accounts: [desktopOne, desktopTwo])
+        assert(restoredLogin, "saved Desktop login is restored")
+        assert(desktopProfiles.desktopUUID() == desktopOneUUID)
+        let firstRestored = try String(contentsOf: desktopProfiles.desktop.appendingPathComponent("sentinel"), encoding: .utf8)
+        let secondSaved = try String(contentsOf: desktopProfiles.profiles.appendingPathComponent("\(desktopTwo.id)/sentinel"), encoding: .utf8)
+        assert(firstRestored == "first-profile" && secondSaved == "second-profile")
+        let wrongUUID = UUID().uuidString.lowercased()
+        try repository.secureWrite(repository.encode(["lastKnownAccountUuid": wrongUUID]), to: desktopProfiles.profiles.appendingPathComponent("\(desktopTwo.id)/config.json"))
+        do { _ = try desktopProfiles.select(desktopTwo, accounts: [desktopOne, desktopTwo]); fatalError("mismatched Desktop profile accepted") } catch {}
+        assert(desktopProfiles.desktopUUID() == desktopOneUUID, "mismatch leaves current Desktop profile untouched")
         let usage = AccountRepository.parseUsage(["rate_limit": ["primary_window": ["used_percent": 28, "limit_window_seconds": 18000, "reset_at": 1900000000]]], provider: .codex)
         assert(usage.count == 1 && usage[0].used == 28 && usage[0].label == "5 hours")
         assert(AccountRepository.parseUsage(["rate_limit": ["primary_window": [:]]], provider: .codex).isEmpty, "missing usage is not zero")
         let claudeUsage = AccountRepository.parseUsage(["five_hour": ["utilization": 120, "resets_at": "2026-09-26T12:00:00.000Z"]], provider: .claude)
         assert(claudeUsage[0].used == 100 && claudeUsage[0].reset != nil)
-        print("Account tests passed: identity, deduplication, switching, rotated-token preservation, permissions, metadata, unsupported storage, Claude profile/fallback, failure safety, usage parsing.")
+        print("Account tests passed: identity, deduplication, switching, rotated-token preservation, permissions, metadata, unsupported storage, Claude Code and Desktop profiles, failure safety, usage parsing.")
     }
     static func tryIdentity(_ repo: AccountRepository, _ provider: AccountProvider) -> String { try! repo.identity(repo.capture(provider)!, provider: provider).0 }
     static func claudeTwoSecret(_ repo: AccountRepository, _ account: SavedAccount) -> Data { try! repo.secret(account).credentials }
