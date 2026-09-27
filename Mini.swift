@@ -79,7 +79,6 @@ private struct MiniAccountRow: View {
 
     private var isActive: Bool { model.active[account.provider] == account.id }
     private var usageStatus: String {
-        if model.refreshing && model.usage[account.id] == nil { return "Loading…" }
         guard let error = model.usage[account.id]?.error else { return "No usage" }
         return error.contains("HTTP 429") ? "Rate limited" : "Unavailable"
     }
@@ -100,7 +99,7 @@ private struct MiniAccountRow: View {
                             .foregroundStyle(MiniStyle.active)
                     }
                 } else {
-                    Button("Switch") { model.activate(account) }
+                    Button("Switch") { model.activate(account, refreshUsage: false) }
                         .font(.system(size: 10, weight: .medium))
                         .buttonStyle(.plain)
                         .padding(.horizontal, 8)
@@ -111,7 +110,17 @@ private struct MiniAccountRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            if let usage = model.usage[account.id], !usage.windows.isEmpty {
+            if model.loadingUsage.contains(account.id) {
+                HStack(spacing: 5) {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(MiniStyle.accent)
+                    Text("Loading…")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityLabel("Loading usage for \(account.name)")
+            } else if let usage = model.usage[account.id], !usage.windows.isEmpty {
                 HStack(alignment: .center, spacing: 2) {
                     ForEach(usage.windows) { window in UsageRing(window: window) }
                     if let error = usage.error { warning(error) }
@@ -275,8 +284,6 @@ private final class MiniPanel: NSPanel {
         if NSApp.currentEvent?.type == .rightMouseUp {
             hidePanel()
             let menu = NSMenu()
-            menu.addItem(withTitle: "Refresh usage", action: #selector(refresh), keyEquivalent: "r").target = self
-            menu.addItem(.separator())
             menu.addItem(withTitle: "Quit ccs mini", action: #selector(quit), keyEquivalent: "q").target = self
             if let button = status.button { menu.popUp(positioning: nil, at: .zero, in: button) }
             return
@@ -288,7 +295,6 @@ private final class MiniPanel: NSPanel {
         showPanel()
     }
 
-    @objc private func refresh() { accounts.refresh(forceUsage: true) }
     @objc private func quit() { NSApp.terminate(nil) }
 
     private func showPanel() {
@@ -296,7 +302,7 @@ private final class MiniPanel: NSPanel {
         // Pick up accounts added or removed by the full ccs app since the last open.
         do { accounts.accounts = try accounts.repository.load() }
         catch { accounts.message = "Cannot load saved accounts: \(error.localizedDescription)" }
-        accounts.refresh()
+        accounts.refresh(forceUsage: true)
         resizePanel()
         let buttonRect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
         let screen = buttonWindow.screen ?? NSScreen.main

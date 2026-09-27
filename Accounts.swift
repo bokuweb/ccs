@@ -271,6 +271,7 @@ final class AccountRepository {
     @Published var usage: [String: AccountUsage] = [:]
     @Published var message = ""
     @Published var refreshing = false
+    @Published var loadingUsage: Set<String> = []
     @Published var signingIn: AccountProvider?
     let repository: AccountRepository
     private var loginTask: Task<Void, Never>?
@@ -345,12 +346,12 @@ final class AccountRepository {
             }
         } catch { message = error.localizedDescription }
     }
-    func activate(_ account: SavedAccount) {
+    func activate(_ account: SavedAccount, refreshUsage: Bool = true) {
         do {
             try repository.activate(account, accounts: &accounts)
             active[account.provider] = account.id
             message = "Switched to \(account.name). New CLI sessions use this account. Restart existing clients to reload credentials."
-            refresh()
+            if refreshUsage { refresh() }
         } catch { message = error.localizedDescription }
     }
     func remove(_ account: SavedAccount) {
@@ -367,8 +368,12 @@ final class AccountRepository {
     func refresh(forceUsage: Bool = false) {
         guard !refreshing else { return }
         refreshing = true
+        loadingUsage = Set(accounts.map(\.id))
         Task {
-            defer { refreshing = false }
+            defer {
+                loadingUsage.removeAll()
+                refreshing = false
+            }
             // A missing login for one provider must not hide the other provider's usage.
             for provider in AccountProvider.allCases where accounts.contains(where: { $0.provider == provider }) {
                 do {
@@ -383,9 +388,15 @@ final class AccountRepository {
             }
             for account in accounts {
                 let now = Date()
-                if account.provider == .claude {
-                    guard now >= (rateLimitedUntil[account.id] ?? .distantPast) else { continue }
-                    guard forceUsage || now >= (nextAutomaticUsageRequest[account.id] ?? .distantPast) else { continue }
+                if account.provider == .claude && !forceUsage {
+                    guard now >= (rateLimitedUntil[account.id] ?? .distantPast) else {
+                        loadingUsage.remove(account.id)
+                        continue
+                    }
+                    guard now >= (nextAutomaticUsageRequest[account.id] ?? .distantPast) else {
+                        loadingUsage.remove(account.id)
+                        continue
+                    }
                     nextAutomaticUsageRequest[account.id] = now.addingTimeInterval(10 * 60)
                 }
                 do {
@@ -399,6 +410,7 @@ final class AccountRepository {
                     var old = usage[account.id] ?? AccountUsage()
                     old.error = error.localizedDescription; usage[account.id] = old
                 }
+                loadingUsage.remove(account.id)
             }
         }
     }

@@ -8,8 +8,8 @@
 	<key>CFBundleName</key><string>ccs mini</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleIconFile</key><string>ccs</string>
-	<key>CFBundleShortVersionString</key><string>0.1.5</string>
-	<key>CFBundleVersion</key><string>6</string>
+	<key>CFBundleShortVersionString</key><string>0.1.6</string>
+	<key>CFBundleVersion</key><string>7</string>
 	<key>LSUIElement</key><true/>
 	<key>NSHighResolutionCapable</key><true/>
 </dict>
