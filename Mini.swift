@@ -47,17 +47,25 @@ private enum MiniMenuBarIcon {
 
 private struct UsageRing: View {
     let window: UsageWindow
+    @State private var displayedUsage = 0.0
+
+    private var ringColor: Color {
+        if window.used >= 85 { return Color(red: 1.0, green: 0.39, blue: 0.39) }
+        if window.used >= 60 { return Color(red: 1.0, green: 0.69, blue: 0.32) }
+        return MiniStyle.accent
+    }
 
     var body: some View {
         VStack(spacing: 2) {
             ZStack {
                 Circle().stroke(.white.opacity(0.10), lineWidth: 3.5)
                 Circle()
-                    .trim(from: 0, to: window.used / 100)
-                    .stroke(window.used >= 90 ? .orange : MiniStyle.accent,
+                    .trim(from: 0, to: displayedUsage / 100)
+                    .stroke(AngularGradient(colors: [ringColor.opacity(0.65), ringColor], center: .center,
+                                            startAngle: .degrees(-90), endAngle: .degrees(270)),
                             style: StrokeStyle(lineWidth: 3.5, lineCap: .round))
                     .rotationEffect(.degrees(-90))
-                Text("\(Int(window.used.rounded()))%")
+                Text("\(Int(displayedUsage.rounded()))%")
                     .font(.system(size: 9, weight: .semibold, design: .rounded))
                     .monospacedDigit()
             }
@@ -70,6 +78,10 @@ private struct UsageRing: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(window.label), \(Int(window.used.rounded())) percent used")
         .help(window.reset.map { "Resets \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "\(window.label) usage")
+        .onAppear { withAnimation(.easeOut(duration: 0.7)) { displayedUsage = window.used } }
+        .onChange(of: window.used) { _, value in
+            withAnimation(.easeOut(duration: 0.7)) { displayedUsage = value }
+        }
     }
 }
 
@@ -86,7 +98,9 @@ private struct MiniAccountRow: View {
     }
     private var usageStatus: String {
         guard let error = model.usage[account.id]?.error else { return "No usage" }
-        return error.contains("HTTP 429") ? "Rate limited" : "Unavailable"
+        if error.contains("HTTP 429") { return "Rate limited" }
+        if error.contains("Sign in again") { return "Sign in again" }
+        return "Unavailable"
     }
 
     var body: some View {

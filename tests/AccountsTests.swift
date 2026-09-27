@@ -8,8 +8,22 @@ final class MemoryVault: CredentialVault {
     func write(_ data: Data, _ service: String, _ account: String) throws { values[service + account] = data; try onWrite?(service) }
     func remove(_ service: String, _ account: String) throws { values[service + account] = nil }
 }
+final class UsageURLProtocol: URLProtocol {
+    static var handler: ((URLRequest) throws -> (Int, Data))?
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        do {
+            let (status, data) = try Self.handler!(request)
+            client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch { client?.urlProtocol(self, didFailWithError: error) }
+    }
+    override func stopLoading() {}
+}
 @main struct AccountsTests {
-    static func main() throws {
+    static func main() async throws {
         assert(KeychainVault.errorMessage(errSecAuthFailed, signatureStatus: errSecCSStaticCodeChanged).contains("Quit and reopen"))
         assert(KeychainVault.errorMessage(errSecAuthFailed).contains("access was denied"))
         assert(KeychainVault.errorMessage(errSecUserCanceled).contains("canceled"))
@@ -89,6 +103,7 @@ final class MemoryVault: CredentialVault {
         assert(tryRead(vault, repository) == oldKeychain)
         let restoredFallback = try Data(contentsOf: root.appendingPathComponent(".claude/.credentials.json"))
         assert(restoredFallback == refreshedClaude, "failed switch restores fallback credentials")
+        try FileManager.default.removeItem(at: root.appendingPathComponent(".claude.json"))
         let desktopOneUUID = UUID().uuidString.lowercased()
         let desktopTwoUUID = UUID().uuidString.lowercased()
         let desktopOne = SavedAccount(id: UUID().uuidString, provider: .claude, identity: "\(desktopOneUUID):org", name: "first")
@@ -118,7 +133,49 @@ final class MemoryVault: CredentialVault {
         assert(AccountRepository.parseUsage(["rate_limit": ["primary_window": [:]]], provider: .codex).isEmpty, "missing usage is not zero")
         let claudeUsage = AccountRepository.parseUsage(["five_hour": ["utilization": 120, "resets_at": "2026-09-26T12:00:00.000Z"]], provider: .claude)
         assert(claudeUsage[0].used == 100 && claudeUsage[0].reset != nil)
-        print("Account tests passed: identity, deduplication, switching, rotated-token preservation, permissions, metadata, unsupported storage, Claude Code and Desktop profiles, failure safety, usage parsing.")
+        let refreshAccount = SavedAccount(id: UUID().uuidString, provider: .claude, identity: "\(UUID().uuidString.lowercased()):", name: "refresh@example.com")
+        let refreshUUID = String(refreshAccount.identity.split(separator: ":").first!)
+        let refreshSecret = AccountSecret(credentials: try repository.encode(["claudeAiOauth": ["accessToken": "expired", "refreshToken": "refresh-old", "expiresAt": 1]]), profile: try repository.encode(["accountUuid": refreshUUID, "emailAddress": refreshAccount.name]))
+        let storedRefresh = try repository.store(refreshSecret, provider: .claude, accounts: &accounts)
+        try repository.secureWrite(repository.encode(["oauthAccount": ["accountUuid": refreshUUID, "emailAddress": refreshAccount.name]]), to: root.appendingPathComponent(".claude.json"))
+        try vault.write(refreshSecret.credentials, repository.claudeService(directory: nil), repository.user)
+        var usageRequests = 0
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [UsageURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        UsageURLProtocol.handler = { request in
+            if request.url?.path == "/v1/oauth/token" {
+                var bodyData = request.httpBody ?? Data()
+                if bodyData.isEmpty, let stream = request.httpBodyStream {
+                    stream.open()
+                    defer { stream.close() }
+                    var buffer = [UInt8](repeating: 0, count: 4096)
+                    while stream.hasBytesAvailable {
+                        let count = stream.read(&buffer, maxLength: buffer.count)
+                        if count <= 0 { break }
+                        bodyData.append(contentsOf: buffer[..<count])
+                    }
+                }
+                let body = try repository.object(bodyData)
+                assert(body["refresh_token"] as? String == "refresh-old")
+                assert(body["client_id"] as? String == "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+                return (200, try repository.encode(["access_token": "renewed", "refresh_token": "refresh-new", "expires_in": 3600]))
+            }
+            usageRequests += 1
+            if usageRequests == 1 {
+                assert(request.value(forHTTPHeaderField: "Authorization") == "Bearer expired")
+                return (401, Data())
+            }
+            assert(request.value(forHTTPHeaderField: "Authorization") == "Bearer renewed")
+            return (200, try repository.encode(["five_hour": ["utilization": 42, "resets_at": "2026-09-28T12:00:00Z"]]))
+        }
+        let refreshedUsage = try await repository.usage(storedRefresh, session: session)
+        assert(refreshedUsage.windows.first?.used == 42 && usageRequests == 2, "expired Claude token is refreshed and usage retried")
+        let savedRefresh = try repository.object(repository.secret(storedRefresh).credentials)["claudeAiOauth"] as! [String: Any]
+        assert(savedRefresh["refreshToken"] as? String == "refresh-new", "rotated refresh token is saved")
+        let activeRefresh = try repository.object(tryRead(vault, repository)!)["claudeAiOauth"] as! [String: Any]
+        assert(activeRefresh["accessToken"] as? String == "renewed", "active Claude Code login receives refreshed token")
+        print("Account tests passed: switching, token preservation, Claude Desktop profiles, usage parsing, Claude OAuth refresh and retry.")
     }
     static func tryIdentity(_ repo: AccountRepository, _ provider: AccountProvider) -> String { try! repo.identity(repo.capture(provider)!, provider: provider).0 }
     static func claudeTwoSecret(_ repo: AccountRepository, _ account: SavedAccount) -> Data { try! repo.secret(account).credentials }

@@ -373,7 +373,16 @@ final class AccountRepository {
     @discardableResult func store(_ secret: AccountSecret, provider: AccountProvider, accounts: inout [SavedAccount]) throws -> SavedAccount {
         let (identity, name) = try identity(secret, provider: provider)
         let account = accounts.first { $0.provider == provider && $0.identity == identity } ?? SavedAccount(id: UUID().uuidString, provider: provider, identity: identity, name: name)
-        try vault.write(JSONEncoder().encode(secret), service, account.id)
+        var toSave = secret
+        if provider == .claude, let existing = try? self.secret(account),
+           let incomingOAuth = try object(secret.credentials)["claudeAiOauth"] as? [String: Any],
+           let savedOAuth = try object(existing.credentials)["claudeAiOauth"] as? [String: Any],
+           let incomingExpiry = (incomingOAuth["expiresAt"] as? NSNumber)?.doubleValue,
+           let savedExpiry = (savedOAuth["expiresAt"] as? NSNumber)?.doubleValue,
+           savedExpiry > incomingExpiry {
+            toSave = existing
+        }
+        try vault.write(JSONEncoder().encode(toSave), service, account.id)
         if !accounts.contains(where: { $0.id == account.id }) { accounts.append(account) }
         try save(accounts)
         return account
@@ -450,7 +459,57 @@ final class AccountRepository {
             return UsageWindow(label: label, used: min(100, max(0, used)), reset: reset)
         }
     }
-    func usage(_ account: SavedAccount) async throws -> AccountUsage {
+    func refreshClaudeToken(_ account: SavedAccount, staleAccess: String, session: URLSession) async throws -> String {
+        var saved = try secret(account)
+        var auth = try object(saved.credentials)
+        guard var oauth = auth["claudeAiOauth"] as? [String: Any],
+              let refresh = oauth["refreshToken"] as? String, !refresh.isEmpty else {
+            throw AccountError.message("Claude sign-in expired. Sign in again to load usage.")
+        }
+        // Claude Code uses this OAuth client and JSON token exchange for its own refresh.
+        var request = URLRequest(url: URL(string: "https://console.anthropic.com/v1/oauth/token")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 15
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try encode([
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+        ])
+        let (data, response) = try await session.data(for: request)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200,
+              let result = try? object(data),
+              let access = result["access_token"] as? String, !access.isEmpty,
+              let lifetime = (result["expires_in"] as? NSNumber)?.doubleValue, lifetime > 0 else {
+            throw AccountError.message(code == 400 || code == 401 || code == 403
+                ? "Claude sign-in expired. Sign in again to load usage."
+                : "Could not refresh Claude sign-in (HTTP \(code)). Retry later.")
+        }
+        oauth["accessToken"] = access
+        oauth["refreshToken"] = result["refresh_token"] as? String ?? refresh
+        oauth["expiresAt"] = (Date().timeIntervalSince1970 + lifetime) * 1000
+        auth["claudeAiOauth"] = oauth
+        saved.credentials = try encode(auth)
+        guard try identity(saved, provider: .claude).0 == account.identity else {
+            throw AccountError.message("Claude account identity changed. Sign in again.")
+        }
+        // Persist rotated refresh tokens before retrying usage. Update the active
+        // Claude Code login only if it still contains the token we just refreshed.
+        try vault.write(JSONEncoder().encode(saved), service, account.id)
+        if let current = try capture(.claude),
+           try identity(current, provider: .claude).0 == account.identity,
+           let currentOAuth = try object(current.credentials)["claudeAiOauth"] as? [String: Any],
+           currentOAuth["accessToken"] as? String == staleAccess {
+            try vault.write(saved.credentials, claudeService(directory: nil), user)
+            let fallback = home.appendingPathComponent(".claude/.credentials.json")
+            if FileManager.default.fileExists(atPath: fallback.path) {
+                try secureWrite(saved.credentials, to: fallback)
+            }
+        }
+        return access
+    }
+    func usage(_ account: SavedAccount, session: URLSession = .shared) async throws -> AccountUsage {
         let auth = try object(secret(account).credentials)
         let codex = account.provider == .codex
         let tokens = auth[codex ? "tokens" : "claudeAiOauth"] as? [String: Any] ?? [:]
@@ -466,8 +525,14 @@ final class AccountRepository {
             request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
             request.setValue("claude-code/2.1.0", forHTTPHeaderField: "User-Agent")
         }
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        var (data, response) = try await session.data(for: request)
+        var code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if !codex && code == 401 {
+            let refreshed = try await refreshClaudeToken(account, staleAccess: access, session: session)
+            request.setValue("Bearer \(refreshed)", forHTTPHeaderField: "Authorization")
+            (data, response) = try await session.data(for: request)
+            code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        }
         if code == 429 { throw AccountError.rateLimited }
         guard code == 200 else { throw AccountError.message(code == 401 || code == 403 ? "Sign in again to refresh usage." : "Usage unavailable (HTTP \(code)). Retry later.") }
         let windows = Self.parseUsage(try object(data), provider: account.provider)
@@ -634,7 +699,7 @@ final class AccountRepository {
                         try await Task.detached { try ClaudeDesktopLauncher.launch(app: app) }.value
                         message = signedIn
                             ? "Claude Code and Desktop switched to \(account.name)."
-                            : "Claude Code switched to \(account.name). Sign in to this account in Claude Desktop once; mini will keep that login for future switches."
+                            : "Claude Code switched to \(account.name). Sign in to this account in Claude Desktop once; ccs will keep that login for future switches."
                         if refreshUsage { refresh() }
                     } catch {
                         if stopped { try? await Task.detached { try ClaudeDesktopLauncher.launch(app: app) }.value }
@@ -757,7 +822,7 @@ struct AccountsView: View {
                 if model.refreshing { ProgressView().controlSize(.small) }
                 Button { model.refresh() } label: { Image(systemName: "arrow.clockwise") }.disabled(model.refreshing)
             }
-            Text("Switch Codex CLI and restart Codex Desktop with the selected account. Sessions stay in your shared Codex home. Claude switching applies to Claude Code; Claude Desktop uses its own login.")
+            Text("Switch Codex CLI and Desktop with shared session history. Claude switches Code and Desktop; sign in to each Claude Desktop account once.")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
@@ -782,7 +847,10 @@ struct AccountsView: View {
                                         }
                                         Button { removing = account } label: { Image(systemName: "trash") }.buttonStyle(.plain).foregroundStyle(.secondary)
                                     }
-                                    if let usage = model.usage[account.id] {
+                                    if model.loadingUsage.contains(account.id) && model.usage[account.id] == nil {
+                                        ProgressView("Loading usage…").controlSize(.small)
+                                    } else if let usage = model.usage[account.id] {
+                                        if model.loadingUsage.contains(account.id) { ProgressView().controlSize(.small) }
                                         ForEach(usage.windows) { window in
                                             HStack(spacing: 10) {
                                                 Text(window.label).frame(width: 48, alignment: .leading)
