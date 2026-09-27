@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 // Match the full app's menu bar ghost.
@@ -41,24 +42,24 @@ private struct UsageRing: View {
     let window: UsageWindow
 
     var body: some View {
-        VStack(spacing: 3) {
+        VStack(spacing: 2) {
             ZStack {
-                Circle().stroke(.white.opacity(0.12), lineWidth: 4)
+                Circle().stroke(.white.opacity(0.12), lineWidth: 3.5)
                 Circle()
                     .trim(from: 0, to: window.used / 100)
                     .stroke(window.used >= 90 ? .orange : .accentColor,
-                            style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                            style: StrokeStyle(lineWidth: 3.5, lineCap: .round))
                     .rotationEffect(.degrees(-90))
                 Text("\(Int(window.used.rounded()))%")
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
                     .monospacedDigit()
             }
-            .frame(width: 39, height: 39)
+            .frame(width: 33, height: 33)
             Text(window.label == "5 hours" ? "5h" : window.label)
-                .font(.system(size: 9))
+                .font(.system(size: 8))
                 .foregroundStyle(.secondary)
         }
-        .frame(width: 51)
+        .frame(width: 43)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(window.label), \(Int(window.used.rounded())) percent used")
         .help(window.reset.map { "Resets \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "\(window.label) usage")
@@ -72,8 +73,8 @@ private struct MiniAccountRow: View {
     private var isActive: Bool { model.active[account.provider] == account.id }
 
     var body: some View {
-        HStack(spacing: 8) {
-            VStack(alignment: .leading, spacing: 6) {
+        HStack(spacing: 6) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text(account.name)
                     .font(.system(size: 12, weight: .medium))
                     .lineLimit(1)
@@ -93,60 +94,50 @@ private struct MiniAccountRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
 
             if let usage = model.usage[account.id], !usage.windows.isEmpty {
-                HStack(alignment: .top, spacing: 2) {
+                HStack(alignment: .center, spacing: 2) {
                     ForEach(usage.windows) { window in UsageRing(window: window) }
+                    if let error = usage.error { warning(error) }
                 }
             } else {
-                Text(model.refreshing ? "Loading…" : "No usage")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    if let error = model.usage[account.id]?.error { warning(error) }
+                    Text(model.refreshing ? "Loading…" : "No usage")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
             }
         }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 9)
-        .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 9))
-        .overlay(alignment: .bottomLeading) {
-            if let error = model.usage[account.id]?.error {
-                Image(systemName: "exclamationmark.circle")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.orange)
-                    .help(error)
-                    .offset(x: 3, y: 4)
-            }
-        }
+        .padding(.horizontal, 9)
+        .frame(height: 59)
+        .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func warning(_ error: String) -> some View {
+        Image(systemName: "exclamationmark.circle.fill")
+            .font(.system(size: 10))
+            .foregroundStyle(.orange)
+            .help(error)
     }
 }
 
 private struct MiniView: View {
     @ObservedObject var accounts: AccountsModel
-    let quit: () -> Void
 
-    private var popoverHeight: CGFloat {
-        min(500, max(230, CGFloat(158 + accounts.accounts.count * 78 + (accounts.message.isEmpty ? 0 : 34))))
+    static let width: CGFloat = 310
+
+    static func height(for accounts: AccountsModel) -> CGFloat {
+        let rowCount = max(2, accounts.accounts.count)
+        let rowGaps = max(0, accounts.accounts.count - 2)
+        let messageHeight: CGFloat = accounts.signingIn != nil || !accounts.message.isEmpty ? 38 : 0
+        return min(500, CGFloat(16 + 46 + 10 + rowCount * 59 + rowGaps * 5) + messageHeight)
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Image(nsImage: MiniMenuBarIcon.makeImage())
-                    .foregroundStyle(.tint)
-                Text("ccs mini").font(.system(size: 14, weight: .semibold))
-                Spacer()
-                if accounts.refreshing { ProgressView().controlSize(.small) }
-                Button { accounts.refresh() } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.plain)
-                    .disabled(accounts.refreshing)
-                    .help("Refresh usage")
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 13)
-
-            Divider()
-
             ScrollView {
-                VStack(alignment: .leading, spacing: 15) {
+                VStack(alignment: .leading, spacing: 10) {
                     ForEach(AccountProvider.allCases) { provider in
-                        VStack(alignment: .leading, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 5) {
                             HStack {
                                 Text(provider.rawValue)
                                     .font(.system(size: 11, weight: .semibold))
@@ -159,33 +150,35 @@ private struct MiniView: View {
                                 } label: {
                                     Image(systemName: "plus")
                                         .font(.system(size: 11, weight: .semibold))
-                                        .frame(width: 20, height: 18)
+                                        .frame(width: 18, height: 18)
                                 }
                                 .menuStyle(.borderlessButton)
+                                .menuIndicator(.hidden)
                                 .fixedSize()
                                 .help("Add or import \(provider.rawValue) account")
                             }
+                            .frame(height: 18)
                             let saved = accounts.accounts.filter { $0.provider == provider }
                             if saved.isEmpty {
                                 Text("No saved accounts")
                                     .font(.system(size: 11))
                                     .foregroundStyle(.secondary)
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(.vertical, 7)
+                                    .frame(height: 59)
                             } else {
-                                ForEach(saved) { account in
-                                    MiniAccountRow(model: accounts, account: account)
+                                VStack(spacing: 5) {
+                                    ForEach(saved) { account in
+                                        MiniAccountRow(model: accounts, account: account)
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 13)
+                .padding(8)
             }
 
             if accounts.signingIn != nil || !accounts.message.isEmpty {
-                Divider()
                 HStack(spacing: 7) {
                     if accounts.signingIn != nil { ProgressView().controlSize(.mini) }
                     Text(accounts.message.isEmpty ? "Waiting for sign-in…" : accounts.message)
@@ -195,25 +188,14 @@ private struct MiniView: View {
                         .help(accounts.message)
                     Spacer(minLength: 0)
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
+                .padding(.horizontal, 12)
+                .frame(height: 38)
             }
-
-            Divider()
-            HStack {
-                Text("Usage used")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                Spacer()
-                Button("Quit ccs mini", action: quit)
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11))
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
         }
-        .frame(width: 354, height: popoverHeight)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .frame(width: Self.width, height: Self.height(for: accounts))
+        .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.18), lineWidth: 1))
         .preferredColorScheme(.dark)
         .task {
             while !Task.isCancelled {
@@ -224,9 +206,16 @@ private struct MiniView: View {
     }
 }
 
+private final class MiniPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
 @MainActor private final class MiniDelegate: NSObject, NSApplicationDelegate {
     private var status: NSStatusItem!
-    private var popover: NSPopover!
+    private var panel: MiniPanel!
+    private var outsideClickMonitor: Any?
+    private var escapeMonitor: Any?
+    private var modelSubscription: AnyCancellable?
     private let accounts = AccountsModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -236,23 +225,87 @@ private struct MiniView: View {
         status.button?.toolTip = "ccs mini: usage and accounts"
         status.button?.target = self
         status.button?.action = #selector(toggle)
+        status.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
-        popover = NSPopover()
-        popover.behavior = .transient
-        popover.animates = true
-        popover.contentViewController = NSHostingController(rootView: MiniView(accounts: accounts) { NSApp.terminate(nil) })
+        panel = MiniPanel(contentRect: NSRect(x: 0, y: 0, width: MiniView.width, height: MiniView.height(for: accounts)),
+                          styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.isFloatingPanel = true
+        panel.level = .popUpMenu
+        panel.hasShadow = true
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.transient, .ignoresCycle]
+        panel.contentView = NSHostingView(rootView: MiniView(accounts: accounts))
+        modelSubscription = accounts.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.resizePanel() }
+        }
     }
 
     @objc private func toggle() {
-        if popover.isShown {
-            popover.performClose(nil)
-        } else if let button = status.button {
-            // Pick up accounts added or removed by the full ccs app since the last open.
-            do { accounts.accounts = try accounts.repository.load() }
-            catch { accounts.message = "Cannot load saved accounts: \(error.localizedDescription)" }
-            accounts.refresh()
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            popover.contentViewController?.view.window?.makeKey()
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            hidePanel()
+            let menu = NSMenu()
+            menu.addItem(withTitle: "Refresh usage", action: #selector(refresh), keyEquivalent: "r").target = self
+            menu.addItem(.separator())
+            menu.addItem(withTitle: "Quit ccs mini", action: #selector(quit), keyEquivalent: "q").target = self
+            if let button = status.button { menu.popUp(positioning: nil, at: .zero, in: button) }
+            return
+        }
+        if panel.isVisible {
+            hidePanel()
+            return
+        }
+        showPanel()
+    }
+
+    @objc private func refresh() { accounts.refresh() }
+    @objc private func quit() { NSApp.terminate(nil) }
+
+    private func showPanel() {
+        guard let button = status.button, let buttonWindow = button.window else { return }
+        // Pick up accounts added or removed by the full ccs app since the last open.
+        do { accounts.accounts = try accounts.repository.load() }
+        catch { accounts.message = "Cannot load saved accounts: \(error.localizedDescription)" }
+        accounts.refresh()
+        resizePanel()
+        let buttonRect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+        let screen = buttonWindow.screen ?? NSScreen.main
+        let visible = screen?.visibleFrame ?? buttonRect
+        let width = panel.frame.width
+        let x = min(max(buttonRect.midX - width / 2, visible.minX + 4), visible.maxX - width - 4)
+        let y = buttonRect.minY - panel.frame.height - 4
+        panel.setFrameOrigin(NSPoint(x: x, y: y))
+        panel.makeKeyAndOrderFront(nil)
+        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            DispatchQueue.main.async { self?.hidePanel() }
+        }
+        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.keyCode == 53 else { return event }
+            self?.hidePanel()
+            return nil
+        }
+    }
+
+    private func resizePanel() {
+        guard panel != nil else { return }
+        let height = MiniView.height(for: accounts)
+        guard panel.frame.height != height else { return }
+        var frame = panel.frame
+        frame.origin.y += frame.height - height
+        frame.size.height = height
+        panel.setFrame(frame, display: panel.isVisible)
+    }
+
+    private func hidePanel() {
+        panel.orderOut(nil)
+        if let outsideClickMonitor {
+            NSEvent.removeMonitor(outsideClickMonitor)
+            self.outsideClickMonitor = nil
+        }
+        if let escapeMonitor {
+            NSEvent.removeMonitor(escapeMonitor)
+            self.escapeMonitor = nil
         }
     }
 }
