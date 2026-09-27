@@ -96,7 +96,6 @@ struct ShortcutRecorder: NSViewRepresentable {
 struct SettingsView: View {
     @ObservedObject var settings: SettingsModel
     @ObservedObject var accounts: AccountsModel
-    @ObservedObject var search: Model
     @State var tab: Int
     var body: some View {
         VStack(spacing: 0) {
@@ -129,10 +128,6 @@ struct SettingsView: View {
                             Toggle("Launch ccs at login", isOn: Binding(get: { settings.launchAtLogin }, set: { settings.setLaunchAtLogin($0) }))
                             if !settings.loginItemMessage.isEmpty { Text(settings.loginItemMessage).foregroundStyle(.orange) }
                         }
-                    }
-                    HStack(spacing: 22) {
-                        Text("Search").foregroundStyle(.secondary).frame(width: 140, alignment: .trailing)
-                        Toggle("Include archived sessions", isOn: $search.includeArchived)
                     }
                     Spacer()
                 }.font(.system(size: 12)).padding(.top, 42).padding(.horizontal, 24)

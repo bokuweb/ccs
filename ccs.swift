@@ -895,6 +895,9 @@ struct SearchView: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.white.opacity(0.35))
                 Spacer()
+                Toggle("Include archived", isOn: $model.includeArchived)
+                    .toggleStyle(.checkbox)
+                    .help("Include archived sessions in search results")
                 Text("Newest started first")
             }
             .font(.system(size: 11))
@@ -1104,9 +1107,11 @@ private enum MenuBarIcon {
         if settingsWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 470), styleMask: [.titled, .closable], backing: .buffered, defer: false)
             window.title = "ccs Settings"; window.isReleasedWhenClosed = false
+            // Keep settings visible when Keychain authentication activates SecurityAgent.
+            window.level = .floating; window.hidesOnDeactivate = false
             window.center(); settingsWindow = window
         }
-        settingsWindow?.contentView = NSHostingView(rootView: SettingsView(settings: settings, accounts: accounts, search: model, tab: tab))
+        settingsWindow?.contentView = NSHostingView(rootView: SettingsView(settings: settings, accounts: accounts, tab: tab))
         settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }

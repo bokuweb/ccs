@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 final class MemoryVault: CredentialVault {
     var values: [String: Data] = [:]
@@ -9,13 +10,17 @@ final class MemoryVault: CredentialVault {
 }
 @main struct AccountsTests {
     static func main() throws {
+        assert(KeychainVault.errorMessage(errSecAuthFailed, signatureStatus: errSecCSStaticCodeChanged).contains("Quit and reopen"))
+        assert(KeychainVault.errorMessage(errSecAuthFailed).contains("access was denied"))
+        assert(KeychainVault.errorMessage(errSecUserCanceled).contains("canceled"))
+        assert(KeychainVault.errorMessage(errSecInteractionNotAllowed).contains("Unlock"))
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let vault = MemoryVault()
         let repository = AccountRepository(home: root, vault: vault)
-        func codex(_ id: String, token: String = "access") throws -> AccountSecret {
+        func codex(_ id: String, token: String = "access", refreshed: String = "") throws -> AccountSecret {
             let payload = try repository.encode(["sub": id, "email": "\(id)@example.com"]).base64EncodedString()
-            return AccountSecret(credentials: try repository.encode(["tokens": ["id_token": "header.\(payload).sig", "account_id": id, "access_token": token]]))
+            return AccountSecret(credentials: try repository.encode(["last_refresh": refreshed, "tokens": ["id_token": "header.\(payload).sig", "account_id": id, "access_token": token]]))
         }
         var accounts: [SavedAccount] = []
         let first = try repository.store(codex("one"), provider: .codex, accounts: &accounts)
@@ -29,6 +34,20 @@ final class MemoryVault: CredentialVault {
         assert(accounts.count == 2, "reauth deduplicates")
         let attrs = try FileManager.default.attributesOfItem(atPath: root.appendingPathComponent(".codex/auth.json").path)
         assert((attrs[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        try repository.activate(first, accounts: &accounts)
+        let legacyDesktop = repository.root.appendingPathComponent("desktop/\(second.id)")
+        let desktopAuth = legacyDesktop.appendingPathComponent("codex/auth.json")
+        try repository.secureWrite(codex("two", token: "desktop-rotated", refreshed: "2026-09-28T01:00:00Z").credentials, to: desktopAuth)
+        try repository.importLegacyDesktopCredentials(second)
+        try repository.activate(second, accounts: &accounts)
+        let switched = try repository.object(Data(contentsOf: root.appendingPathComponent(".codex/auth.json")))
+        assert((switched["tokens"] as? [String: String])?["access_token"] == "desktop-rotated", "desktop refresh survives CLI switch")
+        let launch = CodexDesktopLauncher.arguments(app: URL(fileURLWithPath: "/Applications/Codex.app"), home: root)
+        assert(launch == ["--env", "CODEX_HOME=\(root.appendingPathComponent(".codex").path)", "/Applications/Codex.app"])
+        try repository.secureWrite(codex("two", token: "shared-rotated", refreshed: "2026-09-28T02:00:00Z").credentials, to: root.appendingPathComponent(".codex/auth.json"))
+        try repository.activate(second, accounts: &accounts)
+        let sameAccount = try repository.object(Data(contentsOf: root.appendingPathComponent(".codex/auth.json")))
+        assert((sameAccount["tokens"] as? [String: String])?["access_token"] == "shared-rotated", "same-account restart keeps refreshed token")
         let meta = try String(contentsOf: repository.root.appendingPathComponent("accounts.json"), encoding: .utf8)
         assert(!meta.contains("access_token") && !meta.contains("rotated"), "metadata contains no secrets")
         let invalid = SavedAccount(id: second.id, provider: .codex, identity: "wrong", name: "wrong")

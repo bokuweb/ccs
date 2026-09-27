@@ -34,7 +34,7 @@ The first indexing pass can take time for large histories. Later passes ingest n
 | Claude Code | `~/.claude/projects/**/*.jsonl` |
 | Codex | `~/.codex/sessions/**/*.jsonl` and `~/.codex/archived_sessions/**/*.jsonl` |
 
-Archived sessions are hidden by default. Enable **Settings → General → Include archived sessions** to show them. ccs indexes user and assistant text; tool results and thinking blocks are excluded. Changes to the history file formats may require parser updates.
+Archived sessions are hidden by default. Enable **Include archived** above the search results to show them. ccs indexes user and assistant text; tool results and thinking blocks are excluded. Changes to the history file formats may require parser updates.
 
 If a Claude CLI session has no matching Claude Desktop entry, clicking it opens an in-app preview rather than another desktop session.
 
@@ -44,11 +44,15 @@ Open **Settings → Accounts** to save logins. **Import current** saves an exist
 
 Saved accounts show available five-hour and weekly usage, reset times, and the last successful update. Usage refreshes every minute while Accounts is visible. A failed refresh keeps the last values and shows an error; expired credentials require another sign-in.
 
-**Switch** saves the outgoing credentials and activates the selected account for new CLI sessions. Restart existing clients to reload credentials. Removing a saved account does not log the CLI out. Switching targets the default `~/.codex` directory and Claude Code authentication (`~/.claude.json` plus Keychain); Claude Desktop uses a separate login. Codex requires file-based credential storage: `cli_auth_credentials_store = "keyring"` and `"auto"` are rejected with setup instructions. API-key accounts and custom configuration locations are not supported. Usage endpoints require subscription OAuth accounts and may change.
+**Switch** saves the outgoing credentials and activates the selected account for new CLI sessions. Existing CLI sessions may need a restart to reload credentials. Removing a saved account does not log the CLI out. Codex switching closes Codex Desktop, updates the shared `~/.codex/auth.json`, and reopens Desktop with that same `CODEX_HOME`; sessions and settings remain shared. **Restart Desktop** is available for the active account if Desktop still shows an older login. Claude switching targets Claude Code authentication (`~/.claude.json` plus Keychain). Claude Desktop uses its own app login. Codex requires file-based credential storage: `cli_auth_credentials_store = "keyring"` and `"auto"` are rejected with setup instructions. API-key accounts and custom configuration locations are not supported. Usage endpoints require subscription OAuth accounts and may change.
 
 ## Build and test
 
+Quit ccs before running the build script. The script refuses to replace a running app because that invalidates its live code signature and causes Keychain authentication failures. If this happened with an older build, quit and reopen ccs, then refresh Accounts. A rebuilt ad hoc app may require Keychain access approval again; saved accounts do not need to be deleted.
+
 Run `./build.sh` on macOS to build `ccs.app` and `ccs.zip`. The local build uses ad hoc signing and is not notarized. Distribution without a Gatekeeper override requires a Developer ID Application certificate and notarization (Apple Developer Program membership required). The app source is in `ccs.swift`, `Settings.swift`, and `Accounts.swift`.
+
+For a distribution build, install a Developer ID Application certificate with its private key in Keychain Access, then run `CCS_CODESIGN_IDENTITY='Developer ID Application: NAME (TEAM_ID)' CCS_OUTPUT_DIR=/path/to/release ./build.sh`, replacing `NAME` and `TEAM_ID` with your certificate's values. This signs the app with the hardened runtime and a secure timestamp. Submit the resulting `ccs.zip` with `xcrun notarytool submit /path/to/release/ccs.zip --keychain-profile PROFILE --wait`, then run `xcrun stapler staple /path/to/release/ccs.app`. Recreate `ccs.zip` from the stapled app before distributing it. The notary keychain profile must be set up separately using Apple's `notarytool store-credentials` command.
 
 Run the credential-isolated account tests without accessing real logins:
 

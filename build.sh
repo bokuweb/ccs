@@ -1,6 +1,15 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")"
+ensure_app_stopped() {
+    if /bin/ps -axo comm= | /usr/bin/grep -Fxq "$PWD/ccs.app/Contents/MacOS/ccs"; then
+        echo "Quit ccs before building. Replacing a running app breaks its code signature and Keychain access." >&2
+        exit 1
+    fi
+}
+output_dir=${CCS_OUTPUT_DIR:-$PWD}
+mkdir -p "$output_dir"
+if [ "$output_dir" = "$PWD" ]; then ensure_app_stopped; fi
 # Stage on the system volume: external volumes may create AppleDouble sidecars
 # that cannot be processed by xattr/codesign.
 build_dir=$(mktemp -d "${TMPDIR:-/tmp}/ccs-build.XXXXXX")
@@ -19,7 +28,13 @@ done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/ccs.icns"
 swiftc -parse-as-library -O -framework AppKit -framework SwiftUI -framework Carbon -framework Security -framework ServiceManagement -lsqlite3 ccs.swift Accounts.swift Settings.swift -o "$app/Contents/MacOS/ccs"
 xattr -cr "$app"
-codesign --force --deep --sign - "$app"
-rm -rf ccs.app
-ditto "$app" ccs.app
-ditto -c -k --sequesterRsrc --keepParent "$app" ccs.zip
+if [ -n "${CCS_CODESIGN_IDENTITY:-}" ]; then
+    codesign --force --options runtime --timestamp --sign "$CCS_CODESIGN_IDENTITY" "$app"
+else
+    codesign --force --sign - "$app"
+fi
+codesign --verify --strict --verbose=2 "$app"
+if [ "$output_dir" = "$PWD" ]; then ensure_app_stopped; fi
+rm -rf "$output_dir/ccs.app"
+ditto "$app" "$output_dir/ccs.app"
+ditto -c -k --sequesterRsrc --keepParent "$app" "$output_dir/ccs.zip"

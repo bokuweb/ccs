@@ -14,7 +14,32 @@ struct KeychainVault: CredentialVault {
         [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
     }
     func check(_ status: OSStatus) throws {
-        guard status == errSecSuccess else { throw AccountError.message("Keychain error (\(status)). Allow access in the macOS prompt and retry.") }
+        guard status != errSecSuccess else { return }
+        var signatureStatus = errSecSuccess
+        if status == errSecAuthFailed {
+            var code: SecCode?
+            signatureStatus = SecCodeCopySelf([], &code)
+            if signatureStatus == errSecSuccess, let code {
+                signatureStatus = SecCodeCheckValidity(code, [], nil)
+            }
+        }
+        throw AccountError.message(Self.errorMessage(status, signatureStatus: signatureStatus))
+    }
+    static func errorMessage(_ status: OSStatus, signatureStatus: OSStatus = errSecSuccess) -> String {
+        if status == errSecAuthFailed && signatureStatus != errSecSuccess {
+            return "ccs was updated while running or its signature is invalid. Quit and reopen ccs, then refresh Accounts. If this persists, rebuild after quitting ccs. Saved accounts have not been removed."
+        }
+        switch status {
+        case errSecAuthFailed:
+            return "Keychain access was denied. Allow ccs access if macOS asks, then refresh Accounts. If no prompt appears, quit and reopen ccs and check that the login keychain is unlocked in Keychain Access."
+        case errSecUserCanceled:
+            return "Keychain access was canceled. Refresh Accounts to try again."
+        case errSecInteractionNotAllowed:
+            return "Keychain interaction is unavailable. Unlock your Mac and the login keychain, then refresh Accounts."
+        default:
+            let detail = SecCopyErrorMessageString(status, nil) as String? ?? "Unknown error"
+            return "Keychain error (\(status)): \(detail)"
+        }
     }
     func read(_ service: String, _ account: String) throws -> Data? {
         var q = query(service, account); q[kSecReturnData as String] = true; q[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -73,6 +98,38 @@ struct AccountUsage {
     var windows: [UsageWindow] = []
     var updated: Date?
     var error: String?
+}
+
+enum CodexDesktopLauncher {
+    static func arguments(app: URL, home: URL) -> [String] {
+        ["--env", "CODEX_HOME=\(home.appendingPathComponent(".codex").path)", app.path]
+    }
+    static func stop(_ applications: [NSRunningApplication]) throws {
+        for application in applications where !application.isTerminated {
+            guard application.terminate() else {
+                throw AccountError.message("Could not close Codex Desktop. Close it and try switching again.")
+            }
+        }
+        let deadline = Date().addingTimeInterval(20)
+        while applications.contains(where: { !$0.isTerminated }) && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        guard applications.allSatisfy(\.isTerminated) else {
+            throw AccountError.message("Codex Desktop is still open. Finish or close its current task, then try switching again.")
+        }
+    }
+    static func launch(app: URL, home: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = arguments(app: app, home: home)
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw AccountError.message("macOS could not reopen Codex Desktop (open exited \(process.terminationStatus)).")
+        }
+    }
 }
 
 final class AccountRepository {
@@ -198,9 +255,23 @@ final class AccountRepository {
         let target = try secret(account)
         guard try identity(target, provider: account.provider).0 == account.identity else { throw AccountError.message("Account identity mismatch. Sign in again.") }
         // Save the outgoing account, including rotated tokens, before replacing anything.
-        if let current = try capture(account.provider) { try store(current, provider: account.provider, accounts: &accounts) }
+        if let current = try capture(account.provider) {
+            let sameAccount = try identity(current, provider: account.provider).0 == account.identity
+            if account.provider != .codex || !sameAccount {
+                try store(current, provider: account.provider, accounts: &accounts)
+            } else {
+                let currentRefresh = try object(current.credentials)["last_refresh"] as? String ?? ""
+                let savedRefresh = try object(target.credentials)["last_refresh"] as? String ?? ""
+                if currentRefresh >= savedRefresh {
+                    try store(current, provider: account.provider, accounts: &accounts)
+                }
+            }
+        }
         if account.provider == .codex {
-            try secureWrite(target.credentials, to: home.appendingPathComponent(".codex/auth.json"))
+            // The outgoing account may also be the target. In that case store()
+            // just updated its token, so read it again before writing auth.json.
+            let latest = try secret(account)
+            try secureWrite(latest.credentials, to: home.appendingPathComponent(".codex/auth.json"))
         } else {
             let profileURL = home.appendingPathComponent(".claude.json")
             let oldProfile = try? Data(contentsOf: profileURL)
@@ -221,6 +292,19 @@ final class AccountRepository {
                 } catch { throw AccountError.message("Switch failed and rollback failed. Saved accounts are intact; sign in again before continuing.") }
                 throw error
             }
+        }
+    }
+    func importLegacyDesktopCredentials(_ account: SavedAccount) throws {
+        guard account.provider == .codex, UUID(uuidString: account.id) != nil else { return }
+        let file = root.appendingPathComponent("desktop/\(account.id)/codex/auth.json")
+        guard FileManager.default.fileExists(atPath: file.path) else { return }
+        let candidate = AccountSecret(credentials: try Data(contentsOf: file))
+        guard try identity(candidate, provider: .codex).0 == account.identity else { return }
+        let saved = try secret(account)
+        let candidateRefresh = try object(candidate.credentials)["last_refresh"] as? String ?? ""
+        let savedRefresh = try object(saved.credentials)["last_refresh"] as? String ?? ""
+        if candidateRefresh > savedRefresh {
+            try vault.write(JSONEncoder().encode(candidate), service, account.id)
         }
     }
     static func parseUsage(_ json: [String: Any], provider: AccountProvider) -> [UsageWindow] {
@@ -273,6 +357,7 @@ final class AccountRepository {
     @Published var refreshing = false
     @Published var loadingUsage: Set<String> = []
     @Published var signingIn: AccountProvider?
+    @Published var switchingCodex = false
     let repository: AccountRepository
     private var loginTask: Task<Void, Never>?
     private var nextAutomaticUsageRequest: [String: Date] = [:]
@@ -348,10 +433,45 @@ final class AccountRepository {
     }
     func activate(_ account: SavedAccount, refreshUsage: Bool = true) {
         do {
-            try repository.activate(account, accounts: &accounts)
-            active[account.provider] = account.id
-            message = "Switched to \(account.name). New CLI sessions use this account. Restart existing clients to reload credentials."
-            if refreshUsage { refresh() }
+            if account.provider == .codex {
+                guard !switchingCodex else { return }
+                guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex") else {
+                    throw AccountError.message("Codex Desktop is not installed.")
+                }
+                // Stop the app server before replacing auth.json; otherwise its cached
+                // credentials can keep the visible Desktop on the previous account.
+                let running = NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == "com.openai.codex" }
+                let sharedHome = repository.home
+                switchingCodex = true
+                message = "Switching Codex Desktop to \(account.name)…"
+                Task {
+                    defer { switchingCodex = false }
+                    var stopped = false
+                    do {
+                        try await Task.detached { try CodexDesktopLauncher.stop(running) }.value
+                        stopped = true
+                        for saved in accounts where saved.provider == .codex {
+                            try repository.importLegacyDesktopCredentials(saved)
+                        }
+                        try repository.activate(account, accounts: &accounts)
+                        active[.codex] = account.id
+                        try await Task.detached { try CodexDesktopLauncher.launch(app: app, home: sharedHome) }.value
+                        message = "Codex CLI and Desktop switched to \(account.name)."
+                        if refreshUsage { refresh() }
+                    } catch {
+                        // A failed credential swap must not strand the user with Desktop closed.
+                        if stopped {
+                            try? await Task.detached { try CodexDesktopLauncher.launch(app: app, home: sharedHome) }.value
+                        }
+                        message = error.localizedDescription
+                    }
+                }
+            } else {
+                try repository.activate(account, accounts: &accounts)
+                active[account.provider] = account.id
+                message = "Claude Code switched to \(account.name). Claude Desktop uses its own login."
+                if refreshUsage { refresh() }
+            }
         } catch { message = error.localizedDescription }
     }
     func remove(_ account: SavedAccount) {
@@ -467,7 +587,7 @@ struct AccountsView: View {
                 if model.refreshing { ProgressView().controlSize(.small) }
                 Button { model.refresh() } label: { Image(systemName: "arrow.clockwise") }.disabled(model.refreshing)
             }
-            Text("Manage Codex and Claude Code subscriptions. Switching applies to new CLI sessions; existing clients may need a restart. Claude Desktop login is separate.")
+            Text("Switch Codex CLI and restart Codex Desktop with the selected account. Sessions stay in your shared Codex home. Claude switching applies to Claude Code; Claude Desktop uses its own login.")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
@@ -486,7 +606,12 @@ struct AccountsView: View {
                                         Spacer()
                                         if model.active[provider] == account.id {
                                             Label("Active", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                                        } else { Button("Switch") { model.activate(account) } }
+                                            if provider == .codex {
+                                                Button("Restart Desktop") { model.activate(account) }.disabled(model.switchingCodex)
+                                            }
+                                        } else {
+                                            Button("Switch") { model.activate(account) }.disabled(provider == .codex && model.switchingCodex)
+                                        }
                                         Button { removing = account } label: { Image(systemName: "trash") }.buttonStyle(.plain).foregroundStyle(.secondary)
                                     }
                                     if let usage = model.usage[account.id] {
