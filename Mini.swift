@@ -1,32 +1,198 @@
 import AppKit
 import SwiftUI
 
+private struct UsageRing: View {
+    let window: UsageWindow
+
+    var body: some View {
+        VStack(spacing: 3) {
+            ZStack {
+                Circle().stroke(.white.opacity(0.12), lineWidth: 4)
+                Circle()
+                    .trim(from: 0, to: window.used / 100)
+                    .stroke(window.used >= 90 ? .orange : .accentColor,
+                            style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                Text("\(Int(window.used.rounded()))%")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+            }
+            .frame(width: 39, height: 39)
+            Text(window.label == "5 hours" ? "5h" : window.label)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+        }
+        .frame(width: 51)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(window.label), \(Int(window.used.rounded())) percent used")
+        .help(window.reset.map { "Resets \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "\(window.label) usage")
+    }
+}
+
+private struct MiniAccountRow: View {
+    @ObservedObject var model: AccountsModel
+    let account: SavedAccount
+
+    private var isActive: Bool { model.active[account.provider] == account.id }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(account.name)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(account.name)
+                if isActive {
+                    Label("Active", systemImage: "checkmark.circle.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.green)
+                } else {
+                    Button("Switch") { model.activate(account) }
+                        .font(.system(size: 10, weight: .medium))
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if let usage = model.usage[account.id], !usage.windows.isEmpty {
+                HStack(alignment: .top, spacing: 2) {
+                    ForEach(usage.windows) { window in UsageRing(window: window) }
+                }
+            } else {
+                Text(model.refreshing ? "Loading…" : "No usage")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 9)
+        .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 9))
+        .overlay(alignment: .bottomLeading) {
+            if let error = model.usage[account.id]?.error {
+                Image(systemName: "exclamationmark.circle")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+                    .help(error)
+                    .offset(x: 3, y: 4)
+            }
+        }
+    }
+}
+
 private struct MiniView: View {
     @ObservedObject var accounts: AccountsModel
     let quit: () -> Void
 
+    private var popoverHeight: CGFloat {
+        min(500, max(230, CGFloat(158 + accounts.accounts.count * 78 + (accounts.message.isEmpty ? 0 : 34))))
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            AccountsView(model: accounts)
+            HStack(spacing: 8) {
+                Image(systemName: "person.crop.circle")
+                    .font(.system(size: 17))
+                    .foregroundStyle(.tint)
+                Text("ccs mini").font(.system(size: 14, weight: .semibold))
+                Spacer()
+                if accounts.refreshing { ProgressView().controlSize(.small) }
+                Button { accounts.refresh() } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.plain)
+                    .disabled(accounts.refreshing)
+                    .help("Refresh usage")
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 13)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 15) {
+                    ForEach(AccountProvider.allCases) { provider in
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text(provider.rawValue)
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Menu {
+                                    Button("Import current login") { accounts.importCurrent(provider) }
+                                    Button("Add account…") { accounts.add(provider) }
+                                        .disabled(accounts.signingIn != nil)
+                                } label: {
+                                    Image(systemName: "plus")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .frame(width: 20, height: 18)
+                                }
+                                .menuStyle(.borderlessButton)
+                                .fixedSize()
+                                .help("Add or import \(provider.rawValue) account")
+                            }
+                            let saved = accounts.accounts.filter { $0.provider == provider }
+                            if saved.isEmpty {
+                                Text("No saved accounts")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.vertical, 7)
+                            } else {
+                                ForEach(saved) { account in
+                                    MiniAccountRow(model: accounts, account: account)
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 13)
+            }
+
+            if accounts.signingIn != nil || !accounts.message.isEmpty {
+                Divider()
+                HStack(spacing: 7) {
+                    if accounts.signingIn != nil { ProgressView().controlSize(.mini) }
+                    Text(accounts.message.isEmpty ? "Waiting for sign-in…" : accounts.message)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .help(accounts.message)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+            }
+
             Divider()
             HStack {
-                Text("ccs mini").foregroundStyle(.secondary)
+                Text("Usage used")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
                 Spacer()
                 Button("Quit ccs mini", action: quit)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11))
             }
-            .font(.system(size: 11))
-            .padding(.horizontal, 22)
-            .padding(.vertical, 9)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
         }
-        .frame(width: 600, height: 500)
-        .background(Color(red: 0.105, green: 0.106, blue: 0.115))
+        .frame(width: 354, height: popoverHeight)
+        .background(Color(nsColor: .windowBackgroundColor))
         .preferredColorScheme(.dark)
+        .task {
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(60)) } catch { return }
+                accounts.refresh()
+            }
+        }
     }
 }
 
 @MainActor private final class MiniDelegate: NSObject, NSApplicationDelegate {
     private var status: NSStatusItem!
-    private var window: NSWindow!
+    private var popover: NSPopover!
+    private let accounts = AccountsModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -41,33 +207,23 @@ private struct MiniView: View {
         status.button?.target = self
         status.button?.action = #selector(toggle)
 
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 500),
-                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        window.title = "ccs mini"
-        window.isReleasedWhenClosed = false
-        // SecurityAgent can take focus while Keychain asks for access.
-        window.level = .floating
-        window.hidesOnDeactivate = false
+        popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentViewController = NSHostingController(rootView: MiniView(accounts: accounts) { NSApp.terminate(nil) })
     }
 
     @objc private func toggle() {
-        if window.isVisible {
-            window.orderOut(nil)
-            return
+        if popover.isShown {
+            popover.performClose(nil)
+        } else if let button = status.button {
+            // Pick up accounts added or removed by the full ccs app since the last open.
+            do { accounts.accounts = try accounts.repository.load() }
+            catch { accounts.message = "Cannot load saved accounts: \(error.localizedDescription)" }
+            accounts.refresh()
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
         }
-        // Reload saved accounts on every open so changes made by ccs are visible.
-        let accounts = AccountsModel()
-        window.contentView = NSHostingView(rootView: MiniView(accounts: accounts) { NSApp.terminate(nil) })
-        if let button = status.button, let buttonWindow = button.window, let screen = buttonWindow.screen {
-            let buttonFrame = buttonWindow.convertToScreen(button.frame)
-            let visible = screen.visibleFrame
-            let x = min(max(buttonFrame.midX - 300, visible.minX), visible.maxX - 600)
-            window.setFrameTopLeftPoint(NSPoint(x: x, y: buttonFrame.minY - 8))
-        } else {
-            window.center()
-        }
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
     }
 }
 
