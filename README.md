@@ -48,6 +48,8 @@ Saved accounts show available five-hour and weekly usage, reset times, and the l
 
 ## Build and test
 
+Quit ccs before running the build script. The script refuses to replace a running app because that invalidates its live code signature and causes Keychain authentication failures. If this happened with an older build, quit and reopen ccs, then refresh Accounts. A rebuilt ad hoc app may require Keychain access approval again; saved accounts do not need to be deleted.
+
 Run `./build.sh` on macOS to build `ccs.app` and `ccs.zip`. The local build uses ad hoc signing and is not notarized. Distribution without a Gatekeeper override requires a Developer ID Application certificate and notarization (Apple Developer Program membership required). The app source is in `ccs.swift`, `Settings.swift`, and `Accounts.swift`.
 
 For a local distribution build, set `CCS_CODESIGN_IDENTITY` to the Developer ID Application identity and optionally set `CCS_OUTPUT_DIR` to an output directory. The script signs with the hardened runtime and a secure timestamp. Submit the resulting ZIP with `xcrun notarytool submit ccs.zip --keychain-profile PROFILE --wait`, staple `ccs.app` with `xcrun stapler staple ccs.app`, then recreate the ZIP from the stapled app.

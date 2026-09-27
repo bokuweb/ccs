@@ -3,6 +3,14 @@ set -eu
 cd "$(dirname "$0")"
 output_dir=${CCS_OUTPUT_DIR:-$PWD}
 mkdir -p "$output_dir"
+output_dir=$(cd "$output_dir" && pwd)
+ensure_app_stopped() {
+    if /bin/ps -axo comm= | /usr/bin/grep -Fxq "$output_dir/ccs.app/Contents/MacOS/ccs"; then
+        echo "Quit ccs before building. Replacing a running app breaks its code signature and Keychain access." >&2
+        exit 1
+    fi
+}
+ensure_app_stopped
 # Stage on the system volume: external volumes may create AppleDouble sidecars
 # that cannot be processed by xattr/codesign.
 build_dir=$(mktemp -d "${TMPDIR:-/tmp}/ccs-build.XXXXXX")
@@ -27,6 +35,7 @@ else
     codesign --force --sign - "$app"
 fi
 codesign --verify --strict --verbose=2 "$app"
+ensure_app_stopped
 rm -rf "$output_dir/ccs.app"
 ditto "$app" "$output_dir/ccs.app"
 ditto -c -k --sequesterRsrc --keepParent "$app" "$output_dir/ccs.zip"

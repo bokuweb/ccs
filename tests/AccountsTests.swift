@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 final class MemoryVault: CredentialVault {
     var values: [String: Data] = [:]
@@ -9,6 +10,10 @@ final class MemoryVault: CredentialVault {
 }
 @main struct AccountsTests {
     static func main() throws {
+        assert(KeychainVault.errorMessage(errSecAuthFailed, signatureStatus: errSecCSStaticCodeChanged).contains("Quit and reopen"))
+        assert(KeychainVault.errorMessage(errSecAuthFailed).contains("access was denied"))
+        assert(KeychainVault.errorMessage(errSecUserCanceled).contains("canceled"))
+        assert(KeychainVault.errorMessage(errSecInteractionNotAllowed).contains("Unlock"))
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let vault = MemoryVault()

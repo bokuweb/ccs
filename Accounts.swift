@@ -14,7 +14,32 @@ struct KeychainVault: CredentialVault {
         [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
     }
     func check(_ status: OSStatus) throws {
-        guard status == errSecSuccess else { throw AccountError.message("Keychain error (\(status)). Allow access in the macOS prompt and retry.") }
+        guard status != errSecSuccess else { return }
+        var signatureStatus = errSecSuccess
+        if status == errSecAuthFailed {
+            var code: SecCode?
+            signatureStatus = SecCodeCopySelf([], &code)
+            if signatureStatus == errSecSuccess, let code {
+                signatureStatus = SecCodeCheckValidity(code, [], nil)
+            }
+        }
+        throw AccountError.message(Self.errorMessage(status, signatureStatus: signatureStatus))
+    }
+    static func errorMessage(_ status: OSStatus, signatureStatus: OSStatus = errSecSuccess) -> String {
+        if status == errSecAuthFailed && signatureStatus != errSecSuccess {
+            return "ccs was updated while running or its signature is invalid. Quit and reopen ccs, then refresh Accounts. If this persists, rebuild after quitting ccs. Saved accounts have not been removed."
+        }
+        switch status {
+        case errSecAuthFailed:
+            return "Keychain access was denied. Allow ccs access if macOS asks, then refresh Accounts. If no prompt appears, quit and reopen ccs and check that the login keychain is unlocked in Keychain Access."
+        case errSecUserCanceled:
+            return "Keychain access was canceled. Refresh Accounts to try again."
+        case errSecInteractionNotAllowed:
+            return "Keychain interaction is unavailable. Unlock your Mac and the login keychain, then refresh Accounts."
+        default:
+            let detail = SecCopyErrorMessageString(status, nil) as String? ?? "Unknown error"
+            return "Keychain error (\(status)): \(detail)"
+        }
     }
     func read(_ service: String, _ account: String) throws -> Data? {
         var q = query(service, account); q[kSecReturnData as String] = true; q[kSecMatchLimit as String] = kSecMatchLimitOne
