@@ -40,7 +40,13 @@ struct KeychainVault: CredentialVault {
 }
 enum AccountError: LocalizedError {
     case message(String)
-    var errorDescription: String? { if case .message(let message) = self { return message }; return nil }
+    case rateLimited
+    var errorDescription: String? {
+        switch self {
+        case .message(let message): return message
+        case .rateLimited: return "Usage temporarily rate limited (HTTP 429). Try again later."
+        }
+    }
 }
 enum AccountProvider: String, Codable, CaseIterable, Identifiable {
     case codex = "Codex", claude = "Claude"
@@ -251,6 +257,7 @@ final class AccountRepository {
         }
         let (data, response) = try await URLSession.shared.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if code == 429 { throw AccountError.rateLimited }
         guard code == 200 else { throw AccountError.message(code == 401 || code == 403 ? "Sign in again to refresh usage." : "Usage unavailable (HTTP \(code)). Retry later.") }
         let windows = Self.parseUsage(try object(data), provider: account.provider)
         guard !windows.isEmpty else { throw AccountError.message("Usage limits are not available for this account.") }
@@ -267,6 +274,8 @@ final class AccountRepository {
     @Published var signingIn: AccountProvider?
     let repository: AccountRepository
     private var loginTask: Task<Void, Never>?
+    private var nextAutomaticUsageRequest: [String: Date] = [:]
+    private var rateLimitedUntil: [String: Date] = [:]
     init(repository: AccountRepository = AccountRepository()) {
         self.repository = repository
         do { accounts = try repository.load() } catch { message = "Cannot load saved accounts: \(error.localizedDescription)" }
@@ -355,7 +364,7 @@ final class AccountRepository {
             message = "Removed saved account. The CLI remains signed in."
         } catch { message = error.localizedDescription }
     }
-    func refresh() {
+    func refresh(forceUsage: Bool = false) {
         guard !refreshing else { return }
         refreshing = true
         Task {
@@ -373,8 +382,20 @@ final class AccountRepository {
                 } catch { active[provider] = nil }
             }
             for account in accounts {
-                do { usage[account.id] = try await repository.usage(account) }
+                let now = Date()
+                if account.provider == .claude {
+                    guard now >= (rateLimitedUntil[account.id] ?? .distantPast) else { continue }
+                    guard forceUsage || now >= (nextAutomaticUsageRequest[account.id] ?? .distantPast) else { continue }
+                    nextAutomaticUsageRequest[account.id] = now.addingTimeInterval(10 * 60)
+                }
+                do {
+                    usage[account.id] = try await repository.usage(account)
+                    rateLimitedUntil[account.id] = nil
+                }
                 catch {
+                    if let accountError = error as? AccountError, case .rateLimited = accountError {
+                        rateLimitedUntil[account.id] = Date().addingTimeInterval(15 * 60)
+                    }
                     var old = usage[account.id] ?? AccountUsage()
                     old.error = error.localizedDescription; usage[account.id] = old
                 }

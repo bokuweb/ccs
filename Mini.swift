@@ -78,6 +78,11 @@ private struct MiniAccountRow: View {
     let account: SavedAccount
 
     private var isActive: Bool { model.active[account.provider] == account.id }
+    private var usageStatus: String {
+        if model.refreshing && model.usage[account.id] == nil { return "Loading…" }
+        guard let error = model.usage[account.id]?.error else { return "No usage" }
+        return error.contains("HTTP 429") ? "Rate limited" : "Unavailable"
+    }
 
     var body: some View {
         HStack(spacing: 6) {
@@ -114,7 +119,7 @@ private struct MiniAccountRow: View {
             } else {
                 HStack(spacing: 4) {
                     if let error = model.usage[account.id]?.error { warning(error) }
-                    Text(model.refreshing ? "Loading…" : "No usage")
+                    Text(usageStatus)
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                 }
@@ -227,12 +232,6 @@ private struct MiniView: View {
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.white.opacity(0.20), lineWidth: 0.75))
         .preferredColorScheme(.dark)
-        .task {
-            while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(60)) } catch { return }
-                accounts.refresh()
-            }
-        }
     }
 }
 
@@ -289,7 +288,7 @@ private final class MiniPanel: NSPanel {
         showPanel()
     }
 
-    @objc private func refresh() { accounts.refresh() }
+    @objc private func refresh() { accounts.refresh(forceUsage: true) }
     @objc private func quit() { NSApp.terminate(nil) }
 
     private func showPanel() {
