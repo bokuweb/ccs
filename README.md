@@ -52,6 +52,23 @@ Quit ccs before running the build script. The script refuses to replace a runnin
 
 Run `./build.sh` on macOS to build `ccs.app` and `ccs.zip`. The local build uses ad hoc signing and is not notarized. Distribution without a Gatekeeper override requires a Developer ID Application certificate and notarization (Apple Developer Program membership required). The app source is in `ccs.swift`, `Settings.swift`, and `Accounts.swift`.
 
+For a local distribution build, set `CCS_CODESIGN_IDENTITY` to the Developer ID Application identity and optionally set `CCS_OUTPUT_DIR` to an output directory. The script signs with the hardened runtime and a secure timestamp. Submit the resulting ZIP with `xcrun notarytool submit ccs.zip --keychain-profile PROFILE --wait`, staple `ccs.app` with `xcrun stapler staple ccs.app`, then recreate the ZIP from the stapled app.
+
+### Release artifact
+
+Publishing a GitHub release starts `.github/workflows/release.yml`. The workflow builds with the Developer ID Application certificate, notarizes and staples the app, and uploads `ccs.zip` as a GitHub Actions artifact named `ccs-TAG-macos`. Actions artifacts are retained for 90 days. A local `notarytool` keychain profile is not available on GitHub's runner.
+
+Configure these repository Actions secrets before publishing a release:
+
+| Secret | Value |
+| --- | --- |
+| `MACOS_CERTIFICATE_P12_BASE64` | Base64 encoding of a password-protected `.p12` export containing the Developer ID Application certificate and its private key. |
+| `MACOS_CERTIFICATE_PASSWORD` | Password used when exporting the `.p12`. |
+| `APPLE_ID` | Apple Account email used for notarization. |
+| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for that Apple Account. |
+
+The certificate must belong to team `66U862VS9W` and have the identity `Developer ID Application: Satoshi Ueki (66U862VS9W)`. Keep the `.p12` and passwords out of the repository. On macOS, the certificate secret can be uploaded without printing its contents with `base64 -i /path/to/certificate.p12 | gh secret set MACOS_CERTIFICATE_P12_BASE64 --repo bokuweb/ccs`. Set the other secrets through GitHub's repository settings or `gh secret set`.
+
 Run the credential-isolated account tests without accessing real logins:
 
 ```sh

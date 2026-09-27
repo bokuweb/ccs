@@ -1,8 +1,11 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")"
+output_dir=${CCS_OUTPUT_DIR:-$PWD}
+mkdir -p "$output_dir"
+output_dir=$(cd "$output_dir" && pwd)
 ensure_app_stopped() {
-    if /bin/ps -axo comm= | /usr/bin/grep -Fxq "$PWD/ccs.app/Contents/MacOS/ccs"; then
+    if /bin/ps -axo comm= | /usr/bin/grep -Fxq "$output_dir/ccs.app/Contents/MacOS/ccs"; then
         echo "Quit ccs before building. Replacing a running app breaks its code signature and Keychain access." >&2
         exit 1
     fi
@@ -26,8 +29,13 @@ done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/ccs.icns"
 swiftc -parse-as-library -O -framework AppKit -framework SwiftUI -framework Carbon -framework Security -framework ServiceManagement -lsqlite3 ccs.swift Accounts.swift Settings.swift -o "$app/Contents/MacOS/ccs"
 xattr -cr "$app"
-codesign --force --deep --sign - "$app"
+if [ -n "${CCS_CODESIGN_IDENTITY:-}" ]; then
+    codesign --force --options runtime --timestamp --sign "$CCS_CODESIGN_IDENTITY" "$app"
+else
+    codesign --force --sign - "$app"
+fi
+codesign --verify --strict --verbose=2 "$app"
 ensure_app_stopped
-rm -rf ccs.app
-ditto "$app" ccs.app
-ditto -c -k --sequesterRsrc --keepParent "$app" ccs.zip
+rm -rf "$output_dir/ccs.app"
+ditto "$app" "$output_dir/ccs.app"
+ditto -c -k --sequesterRsrc --keepParent "$app" "$output_dir/ccs.zip"
