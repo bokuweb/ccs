@@ -10,8 +10,17 @@ fi
 build_dir=$(mktemp -d "${TMPDIR:-/tmp}/ccs-mini-build.XXXXXX")
 trap 'rm -rf "$build_dir"' EXIT
 app="$build_dir/ccs-mini.app"
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp MiniInfo.plist "$app/Contents/Info.plist"
+iconset="$build_dir/ccs.iconset"
+mkdir -p "$iconset"
+swift generate-icon.swift "$build_dir/icon.png"
+for size in 16 32 128 256 512; do
+    sips -z "$size" "$size" "$build_dir/icon.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+    doubled=$((size * 2))
+    sips -z "$doubled" "$doubled" "$build_dir/icon.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$iconset" -o "$app/Contents/Resources/ccs.icns"
 swiftc -parse-as-library -O -framework AppKit -framework SwiftUI -framework Security Mini.swift Accounts.swift -o "$app/Contents/MacOS/ccs-mini"
 xattr -cr "$app"
 if [ -n "${CCS_CODESIGN_IDENTITY:-}" ]; then

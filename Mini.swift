@@ -1,6 +1,42 @@
 import AppKit
 import SwiftUI
 
+// Match the full app's menu bar ghost.
+private enum MiniMenuBarIcon {
+    static func makeImage() -> NSImage {
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
+            let ghost = NSBezierPath()
+            ghost.move(to: NSPoint(x: 4, y: 8))
+            ghost.curve(to: NSPoint(x: 10, y: 1), controlPoint1: NSPoint(x: 4, y: 3.5), controlPoint2: NSPoint(x: 6.4, y: 1))
+            ghost.curve(to: NSPoint(x: 16, y: 8), controlPoint1: NSPoint(x: 13.6, y: 1), controlPoint2: NSPoint(x: 16, y: 3.5))
+            ghost.line(to: NSPoint(x: 16, y: 16))
+            ghost.curve(to: NSPoint(x: 14.8, y: 16.7), controlPoint1: NSPoint(x: 16, y: 16.9), controlPoint2: NSPoint(x: 15.5, y: 17.1))
+            ghost.line(to: NSPoint(x: 10.5, y: 14.5))
+            ghost.curve(to: NSPoint(x: 9.5, y: 14.5), controlPoint1: NSPoint(x: 10.2, y: 14.3), controlPoint2: NSPoint(x: 9.8, y: 14.3))
+            ghost.line(to: NSPoint(x: 5.2, y: 16.7))
+            ghost.curve(to: NSPoint(x: 4, y: 16), controlPoint1: NSPoint(x: 4.5, y: 17.1), controlPoint2: NSPoint(x: 4, y: 16.9))
+            ghost.line(to: NSPoint(x: 4, y: 11.5))
+            ghost.curve(to: NSPoint(x: 2, y: 9), controlPoint1: NSPoint(x: 2.5, y: 11), controlPoint2: NSPoint(x: 1.8, y: 10))
+            ghost.curve(to: NSPoint(x: 3.2, y: 8.6), controlPoint1: NSPoint(x: 2, y: 8.2), controlPoint2: NSPoint(x: 2.7, y: 8.1))
+            ghost.curve(to: NSPoint(x: 4, y: 9), controlPoint1: NSPoint(x: 3.5, y: 8.9), controlPoint2: NSPoint(x: 3.8, y: 9))
+            ghost.close()
+            ghost.windingRule = .evenOdd
+            ghost.appendOval(in: NSRect(x: 6.6, y: 6.5, width: 1.8, height: 1.8))
+            ghost.appendOval(in: NSRect(x: 11.6, y: 6.5, width: 1.8, height: 1.8))
+            ghost.move(to: NSPoint(x: 9, y: 8.8))
+            ghost.curve(to: NSPoint(x: 11, y: 8.8), controlPoint1: NSPoint(x: 9.6, y: 9), controlPoint2: NSPoint(x: 10.4, y: 9))
+            ghost.curve(to: NSPoint(x: 9, y: 8.8), controlPoint1: NSPoint(x: 11, y: 10.2), controlPoint2: NSPoint(x: 9, y: 10.2))
+            ghost.close()
+            NSColor.black.setFill()
+            ghost.fill()
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = "ccs mini"
+        return image
+    }
+}
+
 private struct UsageRing: View {
     let window: UsageWindow
 
@@ -92,8 +128,7 @@ private struct MiniView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Image(systemName: "person.crop.circle")
-                    .font(.system(size: 17))
+                Image(nsImage: MiniMenuBarIcon.makeImage())
                     .foregroundStyle(.tint)
                 Text("ccs mini").font(.system(size: 14, weight: .semibold))
                 Spacer()
@@ -197,12 +232,7 @@ private struct MiniView: View {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let icon = NSImage(systemSymbolName: "person.crop.circle", accessibilityDescription: "ccs mini accounts") {
-            icon.isTemplate = true
-            status.button?.image = icon
-        } else {
-            status.button?.title = "ccs"
-        }
+        status.button?.image = MiniMenuBarIcon.makeImage()
         status.button?.toolTip = "ccs mini: usage and accounts"
         status.button?.target = self
         status.button?.action = #selector(toggle)
