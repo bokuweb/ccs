@@ -18,6 +18,16 @@ ccs searches local session titles, conversation text, and project paths. Results
 
 Open **Settings** with the gear button or `⌘,` to change the shortcut. Press a combination with Command, Option, or Control in the hotkey field. If that shortcut is already in use, ccs keeps the previous one. You can also enable **Launch ccs at login**; macOS may ask you to allow it in **System Settings → General → Login Items**.
 
+## ccs mini
+
+[Download ccs mini](https://github.com/bokuweb/ccs/releases/tag/mini-v0.1.10) if you only need account switching and usage in the menu bar. Unzip `ccs-mini.zip`, move `ccs-mini.app` to `/Applications`, and launch it. Click its menu bar icon to open the compact dropdown; mini has no conversation search or session indexing.
+
+<p align="center">
+  <img src="assets/ccs-mini.png" width="800" alt="ccs mini menu bar dropdown showing Codex and Claude accounts and usage rings with example email addresses">
+</p>
+
+The dropdown lists saved Codex and Claude accounts. Click **+** to add an account, **Switch** to activate another account for the CLI and desktop app, or **Restart Desktop** to reopen the app for the active account. Codex shows weekly usage; Claude shows five-hour and weekly usage. The rings animate when usage loads, show a spinner while refreshing, and change from blue to amber to red as the used percentage rises. Usage is fetched when the dropdown opens. Account credentials are stored in macOS Keychain, and the switching behavior is described in [Accounts and usage](#accounts-and-usage).
+
 ## Search and session status
 
 - Results are sorted by session start time, newest first, with the session title as the main heading. The Claude and Codex marks have no surrounding tile. Search matches literal, case-insensitive substrings, and excerpts begin at a match.
@@ -51,6 +61,8 @@ Saved accounts show available five-hour and weekly usage, reset times, and the l
 Quit ccs before running the build script. The script refuses to replace a running app because that invalidates its live code signature and causes Keychain authentication failures. If this happened with an older build, quit and reopen ccs, then refresh Accounts. A rebuilt ad hoc app may require Keychain access approval again; saved accounts do not need to be deleted.
 
 Run `./build.sh` on macOS to build `ccs.app` and `ccs.zip`. The local build uses ad hoc signing and is not notarized. Distribution without a Gatekeeper override requires a Developer ID Application certificate and notarization (Apple Developer Program membership required). The app source is in `ccs.swift`, `Settings.swift`, and `Accounts.swift`.
+
+Run `./build-mini.sh` to build `ccs-mini.app` and `ccs-mini.zip` with the same signing options. Its UI source is in `Mini.swift`.
 
 For a distribution build, install a Developer ID Application certificate with its private key in Keychain Access, then run `CCS_CODESIGN_IDENTITY='Developer ID Application: NAME (TEAM_ID)' CCS_OUTPUT_DIR=/path/to/release ./build.sh`, replacing `NAME` and `TEAM_ID` with your certificate's values. This signs the app with the hardened runtime and a secure timestamp. Submit the resulting `ccs.zip` with `xcrun notarytool submit /path/to/release/ccs.zip --keychain-profile PROFILE --wait`, then run `xcrun stapler staple /path/to/release/ccs.app`. Recreate `ccs.zip` from the stapled app before distributing it. The notary keychain profile must be set up separately using Apple's `notarytool store-credentials` command.
 
