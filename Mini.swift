@@ -2,6 +2,13 @@ import AppKit
 import Combine
 import SwiftUI
 
+private enum MiniStyle {
+    static let accent = Color(red: 0.34, green: 0.64, blue: 1.0)
+    static let active = Color(red: 0.38, green: 0.84, blue: 0.59)
+    static let panelTop = Color(red: 0.17, green: 0.18, blue: 0.20)
+    static let panelBottom = Color(red: 0.13, green: 0.14, blue: 0.16)
+}
+
 // Match the full app's menu bar ghost.
 private enum MiniMenuBarIcon {
     static func makeImage() -> NSImage {
@@ -44,10 +51,10 @@ private struct UsageRing: View {
     var body: some View {
         VStack(spacing: 2) {
             ZStack {
-                Circle().stroke(.white.opacity(0.12), lineWidth: 3.5)
+                Circle().stroke(.white.opacity(0.10), lineWidth: 3.5)
                 Circle()
                     .trim(from: 0, to: window.used / 100)
-                    .stroke(window.used >= 90 ? .orange : .accentColor,
+                    .stroke(window.used >= 90 ? .orange : MiniStyle.accent,
                             style: StrokeStyle(lineWidth: 3.5, lineCap: .round))
                     .rotationEffect(.degrees(-90))
                 Text("\(Int(window.used.rounded()))%")
@@ -81,14 +88,20 @@ private struct MiniAccountRow: View {
                     .truncationMode(.middle)
                     .help(account.name)
                 if isActive {
-                    Label("Active", systemImage: "checkmark.circle.fill")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.green)
+                    HStack(spacing: 5) {
+                        Circle().fill(MiniStyle.active).frame(width: 6, height: 6)
+                        Text("Active")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(MiniStyle.active)
+                    }
                 } else {
                     Button("Switch") { model.activate(account) }
                         .font(.system(size: 10, weight: .medium))
-                        .buttonStyle(.bordered)
-                        .controlSize(.mini)
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(.white.opacity(0.07), in: Capsule())
+                        .overlay(Capsule().stroke(.white.opacity(0.13), lineWidth: 0.5))
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -109,7 +122,16 @@ private struct MiniAccountRow: View {
         }
         .padding(.horizontal, 9)
         .frame(height: 59)
-        .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 8))
+        .background {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(LinearGradient(colors: [.white.opacity(isActive ? 0.085 : 0.065),
+                                              .white.opacity(0.035)],
+                                     startPoint: .topLeading, endPoint: .bottomTrailing))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(.white.opacity(isActive ? 0.12 : 0.07), lineWidth: 0.5)
+                }
+        }
     }
 
     private func warning(_ error: String) -> some View {
@@ -139,9 +161,13 @@ private struct MiniView: View {
                     ForEach(AccountProvider.allCases) { provider in
                         VStack(alignment: .leading, spacing: 5) {
                             HStack {
+                                Capsule()
+                                    .fill(MiniStyle.accent.opacity(0.85))
+                                    .frame(width: 2, height: 10)
                                 Text(provider.rawValue)
                                     .font(.system(size: 11, weight: .semibold))
-                                    .foregroundStyle(.secondary)
+                                    .tracking(0.2)
+                                    .foregroundStyle(.white.opacity(0.74))
                                 Spacer()
                                 Menu {
                                     Button("Import current login") { accounts.importCurrent(provider) }
@@ -193,9 +219,13 @@ private struct MiniView: View {
             }
         }
         .frame(width: Self.width, height: Self.height(for: accounts))
-        .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+        .background {
+            RoundedRectangle(cornerRadius: 12)
+                .fill(LinearGradient(colors: [MiniStyle.panelTop, MiniStyle.panelBottom],
+                                     startPoint: .top, endPoint: .bottom))
+        }
         .clipShape(RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.18), lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.white.opacity(0.20), lineWidth: 0.75))
         .preferredColorScheme(.dark)
         .task {
             while !Task.isCancelled {
