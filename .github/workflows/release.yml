@@ -3,15 +3,30 @@ name: Signed macOS release
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and upload
+        required: true
 
 permissions:
-  contents: read
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
 jobs:
   build:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Check release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
 
       - name: Import Developer ID certificate
         env:
@@ -62,11 +77,35 @@ jobs:
           xcrun stapler validate "$CCS_OUTPUT_DIR/ccs.app"
           ditto -c -k --sequesterRsrc --keepParent "$CCS_OUTPUT_DIR/ccs.app" "$CCS_OUTPUT_DIR/ccs.zip"
           spctl --assess --type execute --verbose "$CCS_OUTPUT_DIR/ccs.app"
+          hdiutil create -volname ccs -srcfolder "$CCS_OUTPUT_DIR/ccs.app" \
+            -format UDZO "$CCS_OUTPUT_DIR/ccs.dmg"
+          xcrun notarytool submit "$CCS_OUTPUT_DIR/ccs.dmg" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$TEAM_ID" \
+            --wait
+          xcrun stapler staple "$CCS_OUTPUT_DIR/ccs.dmg"
+          xcrun stapler validate "$CCS_OUTPUT_DIR/ccs.dmg"
+          (cd "$CCS_OUTPUT_DIR" && shasum -a 256 ccs.zip ccs.dmg > SHA256SUMS)
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CCS_OUTPUT_DIR: ${{ runner.temp }}/ccs-release
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            "$CCS_OUTPUT_DIR/ccs.zip" \
+            "$CCS_OUTPUT_DIR/ccs.dmg" \
+            "$CCS_OUTPUT_DIR/SHA256SUMS" \
+            --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Upload signed release artifact
         uses: actions/upload-artifact@v4
         with:
           name: ccs-${{ github.event.release.tag_name }}-macos
-          path: ${{ runner.temp }}/ccs-release/ccs.zip
+          path: |
+            ${{ runner.temp }}/ccs-release/ccs.zip
+            ${{ runner.temp }}/ccs-release/ccs.dmg
+            ${{ runner.temp }}/ccs-release/SHA256SUMS
           if-no-files-found: error
           retention-days: 90
