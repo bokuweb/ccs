@@ -65,7 +65,13 @@ struct KeychainVault: CredentialVault {
 }
 enum AccountError: LocalizedError {
     case message(String)
-    var errorDescription: String? { if case .message(let message) = self { return message }; return nil }
+    case rateLimited
+    var errorDescription: String? {
+        switch self {
+        case .message(let message): return message
+        case .rateLimited: return "Usage temporarily rate limited (HTTP 429). Try again later."
+        }
+    }
 }
 enum AccountProvider: String, Codable, CaseIterable, Identifiable {
     case codex = "Codex", claude = "Claude"
@@ -92,6 +98,165 @@ struct AccountUsage {
     var windows: [UsageWindow] = []
     var updated: Date?
     var error: String?
+}
+
+enum CodexDesktopLauncher {
+    static func arguments(app: URL, home: URL) -> [String] {
+        ["--env", "CODEX_HOME=\(home.appendingPathComponent(".codex").path)", app.path]
+    }
+    static func stop(_ applications: [NSRunningApplication]) throws {
+        for application in applications where !application.isTerminated {
+            guard application.terminate() else {
+                throw AccountError.message("Could not close Codex Desktop. Close it and try switching again.")
+            }
+        }
+        let deadline = Date().addingTimeInterval(20)
+        while applications.contains(where: { !$0.isTerminated }) && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        guard applications.allSatisfy(\.isTerminated) else {
+            throw AccountError.message("Codex Desktop is still open. Finish or close its current task, then try switching again.")
+        }
+    }
+    static func launch(app: URL, home: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = arguments(app: app, home: home)
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw AccountError.message("macOS could not reopen Codex Desktop (open exited \(process.terminationStatus)).")
+        }
+    }
+}
+
+// Claude Desktop keeps its own Electron login, separate from Claude Code's
+// Keychain credentials. Keep each Desktop profile intact and select it before
+// reopening the app. Moving directories on the same volume is atomic and
+// avoids copying browser cookies or token caches into ccs metadata.
+struct ClaudeDesktopProfiles {
+    let repository: AccountRepository
+    var desktop: URL { repository.home.appendingPathComponent("Library/Application Support/Claude") }
+    var root: URL { repository.root.appendingPathComponent("claude-desktop") }
+    var profiles: URL { root.appendingPathComponent("profiles") }
+    var selection: URL { root.appendingPathComponent("selected.json") }
+
+    func desktopUUID() -> String? {
+        let config = desktop.appendingPathComponent("config.json")
+        guard let data = try? Data(contentsOf: config),
+              let object = try? repository.object(data),
+              let value = object["lastKnownAccountUuid"] as? String,
+              UUID(uuidString: value) != nil else { return nil }
+        return value.lowercased()
+    }
+
+    func selectedID() -> String? {
+        guard let data = try? Data(contentsOf: selection),
+              let object = try? repository.object(data),
+              let value = object["accountID"] as? String,
+              UUID(uuidString: value) != nil else { return nil }
+        return value
+    }
+
+    func accountUUID(_ account: SavedAccount) -> String? {
+        let value = String(account.identity.split(separator: ":", omittingEmptySubsequences: false).first ?? "")
+        return UUID(uuidString: value)?.uuidString.lowercased()
+    }
+
+    func currentSlot(accounts: [SavedAccount]) -> String? {
+        if let uuid = desktopUUID() {
+            return accounts.first(where: { $0.provider == .claude && accountUUID($0) == uuid })?.id ?? "unmanaged-\(uuid)"
+        }
+        return selectedID()
+    }
+
+    // Returns whether the selected Desktop profile already has this login.
+    @discardableResult func select(_ account: SavedAccount, accounts: [SavedAccount]) throws -> Bool {
+        guard account.provider == .claude, UUID(uuidString: account.id) != nil else {
+            throw AccountError.message("Invalid Claude account record.")
+        }
+        guard let targetUUID = accountUUID(account) else {
+            throw AccountError.message("This Claude Code account has no Desktop-compatible account ID. Sign in to Claude Code again and reimport it.")
+        }
+        let files = FileManager.default
+        let current = currentSlot(accounts: accounts)
+        if current == account.id { return desktopUUID() == targetUUID }
+        let target = profiles.appendingPathComponent(account.id, isDirectory: true)
+        let outgoing = current.map { profiles.appendingPathComponent($0, isDirectory: true) }
+            ?? profiles.appendingPathComponent("unassigned-\(UUID().uuidString)", isDirectory: true)
+        let hasDesktop = files.fileExists(atPath: desktop.path)
+        let hasTarget = files.fileExists(atPath: target.path)
+        if hasDesktop && files.fileExists(atPath: outgoing.path) {
+            throw AccountError.message("A saved Claude Desktop profile already occupies this account's slot. No login data was changed.")
+        }
+        if hasTarget {
+            let config = target.appendingPathComponent("config.json")
+            if let data = try? Data(contentsOf: config),
+               let object = try? repository.object(data),
+               let uuid = object["lastKnownAccountUuid"] as? String,
+               uuid.lowercased() != targetUUID {
+                throw AccountError.message("The saved Claude Desktop login does not match this Claude Code account. No login data was changed.")
+            }
+        }
+        try files.createDirectory(at: profiles, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let oldSelection = try? Data(contentsOf: selection)
+        var movedOutgoing = false
+        var movedTarget = false
+        var createdEmpty = false
+        do {
+            if hasDesktop {
+                try files.moveItem(at: desktop, to: outgoing)
+                movedOutgoing = true
+            }
+            if hasTarget {
+                try files.moveItem(at: target, to: desktop)
+                movedTarget = true
+            } else {
+                try files.createDirectory(at: desktop, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+                createdEmpty = true
+            }
+            try repository.secureWrite(repository.encode(["accountID": account.id]), to: selection)
+        } catch {
+            do {
+                if createdEmpty { try files.removeItem(at: desktop) }
+                if movedTarget { try files.moveItem(at: desktop, to: target) }
+                if movedOutgoing { try files.moveItem(at: outgoing, to: desktop) }
+                if let oldSelection { try repository.secureWrite(oldSelection, to: selection) }
+                else if files.fileExists(atPath: selection.path) { try files.removeItem(at: selection) }
+            } catch {
+                throw AccountError.message("Claude Desktop profile switch and rollback failed. Profiles are preserved in \(profiles.path). Close Claude Desktop and inspect them before retrying.")
+            }
+            throw error
+        }
+        return hasTarget && desktopUUID() == targetUUID
+    }
+}
+
+enum ClaudeDesktopLauncher {
+    static func stop(_ applications: [NSRunningApplication]) throws {
+        for application in applications where !application.isTerminated {
+            guard application.terminate() else { throw AccountError.message("Could not close Claude Desktop. Close it and retry.") }
+        }
+        let deadline = Date().addingTimeInterval(20)
+        while applications.contains(where: { !$0.isTerminated }) && Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }
+        guard applications.allSatisfy(\.isTerminated) else {
+            throw AccountError.message("Claude Desktop is still open. Finish its current work, then retry switching.")
+        }
+    }
+    static func launch(app: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = [app.path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw AccountError.message("macOS could not reopen Claude Desktop (open exited \(process.terminationStatus)).")
+        }
+    }
 }
 
 final class AccountRepository {
@@ -208,7 +373,16 @@ final class AccountRepository {
     @discardableResult func store(_ secret: AccountSecret, provider: AccountProvider, accounts: inout [SavedAccount]) throws -> SavedAccount {
         let (identity, name) = try identity(secret, provider: provider)
         let account = accounts.first { $0.provider == provider && $0.identity == identity } ?? SavedAccount(id: UUID().uuidString, provider: provider, identity: identity, name: name)
-        try vault.write(JSONEncoder().encode(secret), service, account.id)
+        var toSave = secret
+        if provider == .claude, let existing = try? self.secret(account),
+           let incomingOAuth = try object(secret.credentials)["claudeAiOauth"] as? [String: Any],
+           let savedOAuth = try object(existing.credentials)["claudeAiOauth"] as? [String: Any],
+           let incomingExpiry = (incomingOAuth["expiresAt"] as? NSNumber)?.doubleValue,
+           let savedExpiry = (savedOAuth["expiresAt"] as? NSNumber)?.doubleValue,
+           savedExpiry > incomingExpiry {
+            toSave = existing
+        }
+        try vault.write(JSONEncoder().encode(toSave), service, account.id)
         if !accounts.contains(where: { $0.id == account.id }) { accounts.append(account) }
         try save(accounts)
         return account
@@ -217,20 +391,34 @@ final class AccountRepository {
         let target = try secret(account)
         guard try identity(target, provider: account.provider).0 == account.identity else { throw AccountError.message("Account identity mismatch. Sign in again.") }
         // Save the outgoing account, including rotated tokens, before replacing anything.
-        if let current = try capture(account.provider) { try store(current, provider: account.provider, accounts: &accounts) }
+        if let current = try capture(account.provider) {
+            let sameAccount = try identity(current, provider: account.provider).0 == account.identity
+            if account.provider != .codex || !sameAccount {
+                try store(current, provider: account.provider, accounts: &accounts)
+            } else {
+                let currentRefresh = try object(current.credentials)["last_refresh"] as? String ?? ""
+                let savedRefresh = try object(target.credentials)["last_refresh"] as? String ?? ""
+                if currentRefresh >= savedRefresh {
+                    try store(current, provider: account.provider, accounts: &accounts)
+                }
+            }
+        }
+        // The outgoing account may also be the target. In that case store()
+        // just updated its token, so read it again before writing credentials.
+        let latest = try secret(account)
         if account.provider == .codex {
-            try secureWrite(target.credentials, to: home.appendingPathComponent(".codex/auth.json"))
+            try secureWrite(latest.credentials, to: home.appendingPathComponent(".codex/auth.json"))
         } else {
             let profileURL = home.appendingPathComponent(".claude.json")
             let oldProfile = try? Data(contentsOf: profileURL)
             var config = try oldProfile.map(object) ?? [:]
-            config["oauthAccount"] = try target.profile.map(object)
+            config["oauthAccount"] = try latest.profile.map(object)
             let old = try vault.read(claudeService(directory: nil), user)
             let fallback = home.appendingPathComponent(".claude/.credentials.json")
             let oldFallback = FileManager.default.fileExists(atPath: fallback.path) ? try Data(contentsOf: fallback) : nil
-            try vault.write(target.credentials, claudeService(directory: nil), user)
+            try vault.write(latest.credentials, claudeService(directory: nil), user)
             do {
-                if oldFallback != nil { try secureWrite(target.credentials, to: fallback) }
+                if oldFallback != nil { try secureWrite(latest.credentials, to: fallback) }
                 try secureWrite(encode(config), to: profileURL)
             } catch {
                 do {
@@ -240,6 +428,19 @@ final class AccountRepository {
                 } catch { throw AccountError.message("Switch failed and rollback failed. Saved accounts are intact; sign in again before continuing.") }
                 throw error
             }
+        }
+    }
+    func importLegacyDesktopCredentials(_ account: SavedAccount) throws {
+        guard account.provider == .codex, UUID(uuidString: account.id) != nil else { return }
+        let file = root.appendingPathComponent("desktop/\(account.id)/codex/auth.json")
+        guard FileManager.default.fileExists(atPath: file.path) else { return }
+        let candidate = AccountSecret(credentials: try Data(contentsOf: file))
+        guard try identity(candidate, provider: .codex).0 == account.identity else { return }
+        let saved = try secret(account)
+        let candidateRefresh = try object(candidate.credentials)["last_refresh"] as? String ?? ""
+        let savedRefresh = try object(saved.credentials)["last_refresh"] as? String ?? ""
+        if candidateRefresh > savedRefresh {
+            try vault.write(JSONEncoder().encode(candidate), service, account.id)
         }
     }
     static func parseUsage(_ json: [String: Any], provider: AccountProvider) -> [UsageWindow] {
@@ -258,7 +459,57 @@ final class AccountRepository {
             return UsageWindow(label: label, used: min(100, max(0, used)), reset: reset)
         }
     }
-    func usage(_ account: SavedAccount) async throws -> AccountUsage {
+    func refreshClaudeToken(_ account: SavedAccount, staleAccess: String, session: URLSession) async throws -> String {
+        var saved = try secret(account)
+        var auth = try object(saved.credentials)
+        guard var oauth = auth["claudeAiOauth"] as? [String: Any],
+              let refresh = oauth["refreshToken"] as? String, !refresh.isEmpty else {
+            throw AccountError.message("Claude sign-in expired. Sign in again to load usage.")
+        }
+        // Claude Code uses this OAuth client and JSON token exchange for its own refresh.
+        var request = URLRequest(url: URL(string: "https://console.anthropic.com/v1/oauth/token")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 15
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try encode([
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+        ])
+        let (data, response) = try await session.data(for: request)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200,
+              let result = try? object(data),
+              let access = result["access_token"] as? String, !access.isEmpty,
+              let lifetime = (result["expires_in"] as? NSNumber)?.doubleValue, lifetime > 0 else {
+            throw AccountError.message(code == 400 || code == 401 || code == 403
+                ? "Claude sign-in expired. Sign in again to load usage."
+                : "Could not refresh Claude sign-in (HTTP \(code)). Retry later.")
+        }
+        oauth["accessToken"] = access
+        oauth["refreshToken"] = result["refresh_token"] as? String ?? refresh
+        oauth["expiresAt"] = (Date().timeIntervalSince1970 + lifetime) * 1000
+        auth["claudeAiOauth"] = oauth
+        saved.credentials = try encode(auth)
+        guard try identity(saved, provider: .claude).0 == account.identity else {
+            throw AccountError.message("Claude account identity changed. Sign in again.")
+        }
+        // Persist rotated refresh tokens before retrying usage. Update the active
+        // Claude Code login only if it still contains the token we just refreshed.
+        try vault.write(JSONEncoder().encode(saved), service, account.id)
+        if let current = try capture(.claude),
+           try identity(current, provider: .claude).0 == account.identity,
+           let currentOAuth = try object(current.credentials)["claudeAiOauth"] as? [String: Any],
+           currentOAuth["accessToken"] as? String == staleAccess {
+            try vault.write(saved.credentials, claudeService(directory: nil), user)
+            let fallback = home.appendingPathComponent(".claude/.credentials.json")
+            if FileManager.default.fileExists(atPath: fallback.path) {
+                try secureWrite(saved.credentials, to: fallback)
+            }
+        }
+        return access
+    }
+    func usage(_ account: SavedAccount, session: URLSession = .shared) async throws -> AccountUsage {
         let auth = try object(secret(account).credentials)
         let codex = account.provider == .codex
         let tokens = auth[codex ? "tokens" : "claudeAiOauth"] as? [String: Any] ?? [:]
@@ -274,8 +525,15 @@ final class AccountRepository {
             request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
             request.setValue("claude-code/2.1.0", forHTTPHeaderField: "User-Agent")
         }
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        var (data, response) = try await session.data(for: request)
+        var code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if !codex && code == 401 {
+            let refreshed = try await refreshClaudeToken(account, staleAccess: access, session: session)
+            request.setValue("Bearer \(refreshed)", forHTTPHeaderField: "Authorization")
+            (data, response) = try await session.data(for: request)
+            code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        }
+        if code == 429 { throw AccountError.rateLimited }
         guard code == 200 else { throw AccountError.message(code == 401 || code == 403 ? "Sign in again to refresh usage." : "Usage unavailable (HTTP \(code)). Retry later.") }
         let windows = Self.parseUsage(try object(data), provider: account.provider)
         guard !windows.isEmpty else { throw AccountError.message("Usage limits are not available for this account.") }
@@ -289,9 +547,14 @@ final class AccountRepository {
     @Published var usage: [String: AccountUsage] = [:]
     @Published var message = ""
     @Published var refreshing = false
+    @Published var loadingUsage: Set<String> = []
     @Published var signingIn: AccountProvider?
+    @Published var switchingCodex = false
+    @Published var switchingClaude = false
     let repository: AccountRepository
     private var loginTask: Task<Void, Never>?
+    private var nextAutomaticUsageRequest: [String: Date] = [:]
+    private var rateLimitedUntil: [String: Date] = [:]
     init(repository: AccountRepository = AccountRepository()) {
         self.repository = repository
         do { accounts = try repository.load() } catch { message = "Cannot load saved accounts: \(error.localizedDescription)" }
@@ -361,12 +624,89 @@ final class AccountRepository {
             }
         } catch { message = error.localizedDescription }
     }
-    func activate(_ account: SavedAccount) {
+    func activate(_ account: SavedAccount, refreshUsage: Bool = true) {
         do {
-            try repository.activate(account, accounts: &accounts)
-            active[account.provider] = account.id
-            message = "Switched to \(account.name). New CLI sessions use this account. Restart existing clients to reload credentials."
-            refresh()
+            if account.provider == .codex {
+                guard !switchingCodex else { return }
+                guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex") else {
+                    throw AccountError.message("Codex Desktop is not installed.")
+                }
+                // Stop the app server before replacing auth.json; otherwise its cached
+                // credentials can keep the visible Desktop on the previous account.
+                let running = NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == "com.openai.codex" }
+                let sharedHome = repository.home
+                switchingCodex = true
+                message = "Switching Codex Desktop to \(account.name)…"
+                Task {
+                    defer { switchingCodex = false }
+                    var stopped = false
+                    do {
+                        try await Task.detached { try CodexDesktopLauncher.stop(running) }.value
+                        stopped = true
+                        for saved in accounts where saved.provider == .codex {
+                            try repository.importLegacyDesktopCredentials(saved)
+                        }
+                        try repository.activate(account, accounts: &accounts)
+                        active[.codex] = account.id
+                        try await Task.detached { try CodexDesktopLauncher.launch(app: app, home: sharedHome) }.value
+                        message = "Codex CLI and Desktop switched to \(account.name)."
+                        if refreshUsage { refresh() }
+                    } catch {
+                        // A failed credential swap must not strand the user with Desktop closed.
+                        if stopped {
+                            try? await Task.detached { try CodexDesktopLauncher.launch(app: app, home: sharedHome) }.value
+                        }
+                        message = error.localizedDescription
+                    }
+                }
+            } else {
+                guard !switchingClaude else { return }
+                guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.anthropic.claudefordesktop") else {
+                    try repository.activate(account, accounts: &accounts)
+                    active[.claude] = account.id
+                    message = "Claude Code switched to \(account.name)."
+                    if refreshUsage { refresh() }
+                    return
+                }
+                let saved = try repository.secret(account)
+                guard try repository.identity(saved, provider: .claude).0 == account.identity else {
+                    throw AccountError.message("Account identity mismatch. Sign in again.")
+                }
+                let running = NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == "com.anthropic.claudefordesktop" }
+                let profiles = ClaudeDesktopProfiles(repository: repository)
+                let previous = accounts.first { $0.id == profiles.currentSlot(accounts: accounts) }
+                switchingClaude = true
+                message = "Switching Claude Desktop to \(account.name)…"
+                Task {
+                    defer { switchingClaude = false }
+                    var stopped = false
+                    var changedProfile = false
+                    do {
+                        try await Task.detached { try ClaudeDesktopLauncher.stop(running) }.value
+                        stopped = true
+                        let targetAlreadySelected = profiles.currentSlot(accounts: accounts) == account.id
+                        let signedIn = try profiles.select(account, accounts: accounts)
+                        changedProfile = !targetAlreadySelected
+                        do {
+                            try repository.activate(account, accounts: &accounts)
+                        } catch {
+                            if changedProfile, let previous {
+                                _ = try? profiles.select(previous, accounts: accounts)
+                            }
+                            throw error
+                        }
+                        active[.claude] = account.id
+                        try await Task.detached { try ClaudeDesktopLauncher.launch(app: app) }.value
+                        message = signedIn
+                            ? "Claude Code and Desktop switched to \(account.name)."
+                            : "Claude Code switched to \(account.name). Sign in to this account in Claude Desktop once; ccs will keep that login for future switches."
+                        if refreshUsage { refresh() }
+                    } catch {
+                        if stopped { try? await Task.detached { try ClaudeDesktopLauncher.launch(app: app) }.value }
+                        message = error.localizedDescription
+                    }
+                }
+            }
         } catch { message = error.localizedDescription }
     }
     func remove(_ account: SavedAccount) {
@@ -380,11 +720,15 @@ final class AccountRepository {
             message = "Removed saved account. The CLI remains signed in."
         } catch { message = error.localizedDescription }
     }
-    func refresh() {
+    func refresh(forceUsage: Bool = false) {
         guard !refreshing else { return }
         refreshing = true
+        loadingUsage = Set(accounts.map(\.id))
         Task {
-            defer { refreshing = false }
+            defer {
+                loadingUsage.removeAll()
+                refreshing = false
+            }
             // A missing login for one provider must not hide the other provider's usage.
             for provider in AccountProvider.allCases where accounts.contains(where: { $0.provider == provider }) {
                 do {
@@ -398,11 +742,30 @@ final class AccountRepository {
                 } catch { active[provider] = nil }
             }
             for account in accounts {
-                do { usage[account.id] = try await repository.usage(account) }
+                let now = Date()
+                if account.provider == .claude && !forceUsage {
+                    guard now >= (rateLimitedUntil[account.id] ?? .distantPast) else {
+                        loadingUsage.remove(account.id)
+                        continue
+                    }
+                    guard now >= (nextAutomaticUsageRequest[account.id] ?? .distantPast) else {
+                        loadingUsage.remove(account.id)
+                        continue
+                    }
+                    nextAutomaticUsageRequest[account.id] = now.addingTimeInterval(10 * 60)
+                }
+                do {
+                    usage[account.id] = try await repository.usage(account)
+                    rateLimitedUntil[account.id] = nil
+                }
                 catch {
+                    if let accountError = error as? AccountError, case .rateLimited = accountError {
+                        rateLimitedUntil[account.id] = Date().addingTimeInterval(15 * 60)
+                    }
                     var old = usage[account.id] ?? AccountUsage()
                     old.error = error.localizedDescription; usage[account.id] = old
                 }
+                loadingUsage.remove(account.id)
             }
         }
     }
@@ -459,7 +822,7 @@ struct AccountsView: View {
                 if model.refreshing { ProgressView().controlSize(.small) }
                 Button { model.refresh() } label: { Image(systemName: "arrow.clockwise") }.disabled(model.refreshing)
             }
-            Text("Manage Codex and Claude Code subscriptions. Switching applies to new CLI sessions; existing clients may need a restart. Claude Desktop login is separate.")
+            Text("Switch Codex CLI and Desktop with shared session history. Claude switches Code and Desktop; sign in to each Claude Desktop account once.")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
@@ -478,10 +841,16 @@ struct AccountsView: View {
                                         Spacer()
                                         if model.active[provider] == account.id {
                                             Label("Active", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                                        } else { Button("Switch") { model.activate(account) } }
+                                            Button("Restart Desktop") { model.activate(account) }.disabled(model.switchingCodex || model.switchingClaude)
+                                        } else {
+                                            Button("Switch") { model.activate(account) }.disabled(model.switchingCodex || model.switchingClaude)
+                                        }
                                         Button { removing = account } label: { Image(systemName: "trash") }.buttonStyle(.plain).foregroundStyle(.secondary)
                                     }
-                                    if let usage = model.usage[account.id] {
+                                    if model.loadingUsage.contains(account.id) && model.usage[account.id] == nil {
+                                        ProgressView("Loading usage…").controlSize(.small)
+                                    } else if let usage = model.usage[account.id] {
+                                        if model.loadingUsage.contains(account.id) { ProgressView().controlSize(.small) }
                                         ForEach(usage.windows) { window in
                                             HStack(spacing: 10) {
                                                 Text(window.label).frame(width: 48, alignment: .leading)
