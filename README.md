@@ -68,7 +68,7 @@ For a local distribution build, set `CCS_CODESIGN_IDENTITY` to the Developer ID 
 
 ### Release artifact
 
-Publishing a GitHub release starts `.github/workflows/release.yml`. The workflow builds with the Developer ID Application certificate, notarizes and staples the app and DMG, then attaches `ccs.zip`, `ccs.dmg`, and `SHA256SUMS` to the GitHub release. It also saves them as a GitHub Actions artifact named `ccs-TAG-macos` for 90 days. To retry an existing release after fixing credentials, run the workflow manually with its tag. A local `notarytool` keychain profile is not available on GitHub's runner.
+Publishing a GitHub release starts `.github/workflows/release.yml`. A `vX.Y.Z` tag builds `ccs.app`; a `mini-vX.Y.Z` tag builds `ccs-mini.app`. The workflow signs the selected app with Developer ID, requires Apple's notarization result to be `Accepted`, staples the app and DMG, and only then attaches the matching ZIP, DMG, and `SHA256SUMS` to the release. It also saves them as a GitHub Actions artifact for 90 days. To retry an existing release after fixing credentials, run the workflow manually with its tag. A local `notarytool` keychain profile is not available on GitHub's runner.
 
 Configure these repository Actions secrets before publishing a release:
 
