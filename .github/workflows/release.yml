@@ -28,6 +28,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
 
+      - name: Select app for release tag
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_TAG" =~ ^mini-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'APP_NAME=ccs-mini' >> "$GITHUB_ENV"
+            echo 'BUILD_SCRIPT=build-mini.sh' >> "$GITHUB_ENV"
+          elif [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'APP_NAME=ccs' >> "$GITHUB_ENV"
+            echo 'BUILD_SCRIPT=build.sh' >> "$GITHUB_ENV"
+          else
+            echo "Unsupported release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
       - name: Import Developer ID certificate
         env:
           CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
@@ -55,8 +69,9 @@ jobs:
           CCS_CODESIGN_IDENTITY: 'Developer ID Application: Satoshi Ueki (66U862VS9W)'
           CCS_OUTPUT_DIR: ${{ runner.temp }}/ccs-release
         run: |
-          ./build.sh
-          codesign --verify --strict --deep --verbose=2 "$CCS_OUTPUT_DIR/ccs.app"
+          set -euo pipefail
+          "./$BUILD_SCRIPT"
+          codesign --verify --strict --deep --verbose=2 "$CCS_OUTPUT_DIR/$APP_NAME.app"
 
       - name: Notarize and staple
         env:
@@ -68,44 +83,51 @@ jobs:
           set -euo pipefail
           test -n "$APPLE_ID"
           test -n "$APPLE_APP_SPECIFIC_PASSWORD"
-          xcrun notarytool submit "$CCS_OUTPUT_DIR/ccs.zip" \
+          xcrun notarytool submit "$CCS_OUTPUT_DIR/$APP_NAME.zip" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$TEAM_ID" \
-            --wait
-          xcrun stapler staple "$CCS_OUTPUT_DIR/ccs.app"
-          xcrun stapler validate "$CCS_OUTPUT_DIR/ccs.app"
-          ditto -c -k --sequesterRsrc --keepParent "$CCS_OUTPUT_DIR/ccs.app" "$CCS_OUTPUT_DIR/ccs.zip"
-          spctl --assess --type execute --verbose "$CCS_OUTPUT_DIR/ccs.app"
-          hdiutil create -volname ccs -srcfolder "$CCS_OUTPUT_DIR/ccs.app" \
-            -format UDZO "$CCS_OUTPUT_DIR/ccs.dmg"
-          xcrun notarytool submit "$CCS_OUTPUT_DIR/ccs.dmg" \
+            --wait --output-format json > "$RUNNER_TEMP/app-notary.json"
+          jq -e '.status == "Accepted"' "$RUNNER_TEMP/app-notary.json"
+          xcrun stapler staple "$CCS_OUTPUT_DIR/$APP_NAME.app"
+          xcrun stapler validate "$CCS_OUTPUT_DIR/$APP_NAME.app"
+          ditto -c -k --sequesterRsrc --keepParent "$CCS_OUTPUT_DIR/$APP_NAME.app" "$CCS_OUTPUT_DIR/$APP_NAME.zip"
+          spctl --assess --type execute --verbose "$CCS_OUTPUT_DIR/$APP_NAME.app"
+          hdiutil create -volname "$APP_NAME" -srcfolder "$CCS_OUTPUT_DIR/$APP_NAME.app" \
+            -format UDZO "$CCS_OUTPUT_DIR/$APP_NAME.dmg"
+          xcrun notarytool submit "$CCS_OUTPUT_DIR/$APP_NAME.dmg" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$TEAM_ID" \
-            --wait
-          xcrun stapler staple "$CCS_OUTPUT_DIR/ccs.dmg"
-          xcrun stapler validate "$CCS_OUTPUT_DIR/ccs.dmg"
-          (cd "$CCS_OUTPUT_DIR" && shasum -a 256 ccs.zip ccs.dmg > SHA256SUMS)
+            --wait --output-format json > "$RUNNER_TEMP/dmg-notary.json"
+          jq -e '.status == "Accepted"' "$RUNNER_TEMP/dmg-notary.json"
+          xcrun stapler staple "$CCS_OUTPUT_DIR/$APP_NAME.dmg"
+          xcrun stapler validate "$CCS_OUTPUT_DIR/$APP_NAME.dmg"
+          (cd "$CCS_OUTPUT_DIR" && shasum -a 256 "$APP_NAME.zip" "$APP_NAME.dmg" > SHA256SUMS)
 
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
           CCS_OUTPUT_DIR: ${{ runner.temp }}/ccs-release
         run: |
+          set -euo pipefail
           gh release upload "$RELEASE_TAG" \
-            "$CCS_OUTPUT_DIR/ccs.zip" \
-            "$CCS_OUTPUT_DIR/ccs.dmg" \
+            "$CCS_OUTPUT_DIR/$APP_NAME.zip" \
+            "$CCS_OUTPUT_DIR/$APP_NAME.dmg" \
             "$CCS_OUTPUT_DIR/SHA256SUMS" \
             --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Upload signed release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ccs-${{ github.event.release.tag_name }}-macos
+          name: ${{ env.APP_NAME }}-${{ env.RELEASE_TAG }}-macos
           path: |
-            ${{ runner.temp }}/ccs-release/ccs.zip
-            ${{ runner.temp }}/ccs-release/ccs.dmg
+            ${{ runner.temp }}/ccs-release/${{ env.APP_NAME }}.zip
+            ${{ runner.temp }}/ccs-release/${{ env.APP_NAME }}.dmg
             ${{ runner.temp }}/ccs-release/SHA256SUMS
           if-no-files-found: error
           retention-days: 90
+
+      - name: Remove temporary signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/ccs-signing.keychain-db" || true
