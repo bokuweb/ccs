@@ -18,7 +18,7 @@ env:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -73,6 +73,7 @@ jobs:
           set -euo pipefail
           "./$BUILD_SCRIPT"
           minos=$(otool -l "$CCS_OUTPUT_DIR/$APP_NAME.app/Contents/MacOS/$APP_NAME" | awk '/cmd LC_BUILD_VERSION/ { in_build = 1 } in_build && $1 == "minos" { print $2; exit }')
+          echo "Built minimum macOS: ${minos:-missing}; expected: $MACOSX_DEPLOYMENT_TARGET"
           test "$minos" = "$MACOSX_DEPLOYMENT_TARGET"
           codesign --verify --strict --deep --verbose=2 "$CCS_OUTPUT_DIR/$APP_NAME.app"
 
