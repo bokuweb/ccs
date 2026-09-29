@@ -88,6 +88,8 @@ swiftc -parse-as-library -framework AppKit -framework SwiftUI -framework Securit
 /tmp/ccs-account-tests
 ```
 
+To also verify Claude credential reads, updates, and removal through macOS Keychain, run `/tmp/ccs-account-tests --keychain-integration`. This creates and cleans up a uniquely named dummy item without changing real logins.
+
 Run the search regression fixtures:
 
 ```sh
