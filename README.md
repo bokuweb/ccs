@@ -20,13 +20,15 @@ Open **Settings** with the gear button or `⌘,` to change the shortcut. Press a
 
 ## ccs mini
 
-[Download ccs mini](https://github.com/bokuweb/ccs/releases/tag/mini-v0.1.10) if you only need account switching and usage in the menu bar. Unzip `ccs-mini.zip`, move `ccs-mini.app` to `/Applications`, and launch it. Click its menu bar icon to open the compact dropdown; mini has no conversation search or session indexing.
+[Download ccs mini](https://github.com/bokuweb/ccs/releases/tag/mini-v0.1.11) if you only need account switching and usage in the menu bar. Open `ccs-mini.dmg`, drag `ccs-mini.app` onto **Applications**, and launch it from Applications. Click its menu bar icon to open the compact dropdown; mini has no conversation search or session indexing.
 
 <p align="center">
   <img src="assets/ccs-mini.png" width="800" alt="ccs mini menu bar dropdown showing Codex and Claude accounts and usage rings with example email addresses">
 </p>
 
 The dropdown lists saved Codex and Claude accounts. Click **+** to add an account, **Switch** to activate another account for the CLI and desktop app, or **Restart Desktop** to reopen the app for the active account. Codex shows weekly usage; Claude shows five-hour and weekly usage. The rings animate when usage loads, show a spinner while refreshing, and change from blue to amber to red as the used percentage rises. Usage is fetched when the dropdown opens. Account credentials are stored in macOS Keychain, and the switching behavior is described in [Accounts and usage](#accounts-and-usage).
+
+On its first launch from Applications, mini enables **Launch at Login**. Right-click its menu bar icon to turn that setting on or off. If macOS requires approval, use **Allow in System Settings…** from the same menu.
 
 ## Search and session status
 
