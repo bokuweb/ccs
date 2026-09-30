@@ -4,7 +4,8 @@ import Security
 final class MemoryVault: CredentialVault {
     var values: [String: Data] = [:]
     var onWrite: ((String) throws -> Void)?
-    func read(_ service: String, _ account: String) throws -> Data? { values[service + account] }
+    var onRead: ((String) -> Void)?
+    func read(_ service: String, _ account: String) throws -> Data? { onRead?(service); return values[service + account] }
     func write(_ data: Data, _ service: String, _ account: String) throws { values[service + account] = data; try onWrite?(service) }
     func remove(_ service: String, _ account: String) throws { values[service + account] = nil }
 }
@@ -24,6 +25,8 @@ final class UsageURLProtocol: URLProtocol {
 }
 @main struct AccountsTests {
     static func main() async throws {
+        try claudeKeychainTests()
+        if CommandLine.arguments.contains("--keychain-integration") { try claudeKeychainIntegrationTest() }
         assert(KeychainVault.errorMessage(errSecAuthFailed, signatureStatus: errSecCSStaticCodeChanged).contains("Quit and reopen"))
         assert(KeychainVault.errorMessage(errSecAuthFailed).contains("access was denied"))
         assert(KeychainVault.errorMessage(errSecUserCanceled).contains("canceled"))
@@ -81,6 +84,13 @@ final class UsageURLProtocol: URLProtocol {
         try repository.secureWrite(claude("c1").credentials, to: root.appendingPathComponent(".claude/.credentials.json"))
         try repository.activate(claudeTwo, accounts: &accounts)
         assert(tryIdentity(repository, .claude) == claudeTwo.identity)
+        await MainActor.run {
+            let model = AccountsModel(repository: repository)
+            model.importCurrent(.claude, refreshUsage: false)
+            assert(model.active[.claude] == claudeTwo.id, "import uses captured credentials without invoking a CLI or starting login")
+            assert(model.accounts.count == accounts.count, "import deduplicates the current Claude account")
+            assert(model.message.hasPrefix("Imported "), "import completes synchronously from the current credentials")
+        }
         let after = try repository.object(Data(contentsOf: root.appendingPathComponent(".claude.json")))
         assert(after["unrelatedSetting"] as? Bool == true)
         let fallback = try Data(contentsOf: root.appendingPathComponent(".claude/.credentials.json"))
@@ -138,7 +148,11 @@ final class UsageURLProtocol: URLProtocol {
         let refreshSecret = AccountSecret(credentials: try repository.encode(["claudeAiOauth": ["accessToken": "expired", "refreshToken": "refresh-old", "expiresAt": 1]]), profile: try repository.encode(["accountUuid": refreshUUID, "emailAddress": refreshAccount.name]))
         let storedRefresh = try repository.store(refreshSecret, provider: .claude, accounts: &accounts)
         try repository.secureWrite(repository.encode(["oauthAccount": ["accountUuid": refreshUUID, "emailAddress": refreshAccount.name]]), to: root.appendingPathComponent(".claude.json"))
+        assert(repository.currentClaudeIdentity() == storedRefresh.identity)
+        try repository.secureWrite(refreshSecret.credentials, to: root.appendingPathComponent(".claude/.credentials.json"))
         try vault.write(refreshSecret.credentials, repository.claudeService(directory: nil), repository.user)
+        var claudeKeychainReads = 0
+        vault.onRead = { if $0 == repository.claudeService(directory: nil) { claudeKeychainReads += 1 } }
         var usageRequests = 0
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [UsageURLProtocol.self]
@@ -173,11 +187,68 @@ final class UsageURLProtocol: URLProtocol {
         assert(refreshedUsage.windows.first?.used == 42 && usageRequests == 2, "expired Claude token is refreshed and usage retried")
         let savedRefresh = try repository.object(repository.secret(storedRefresh).credentials)["claudeAiOauth"] as! [String: Any]
         assert(savedRefresh["refreshToken"] as? String == "refresh-new", "rotated refresh token is saved")
-        let activeRefresh = try repository.object(tryRead(vault, repository)!)["claudeAiOauth"] as! [String: Any]
-        assert(activeRefresh["accessToken"] as? String == "renewed", "active Claude Code login receives refreshed token")
+        assert(claudeKeychainReads == 0, "usage refresh does not read Claude Code Keychain")
+        let fallbackRefresh = try repository.object(Data(contentsOf: root.appendingPathComponent(".claude/.credentials.json")))["claudeAiOauth"] as! [String: Any]
+        assert(fallbackRefresh["accessToken"] as? String == "renewed", "matching file credentials receive refreshed token")
         print("Account tests passed: switching, token preservation, Claude Desktop profiles, usage parsing, Claude OAuth refresh and retry.")
     }
     static func tryIdentity(_ repo: AccountRepository, _ provider: AccountProvider) -> String { try! repo.identity(repo.capture(provider)!, provider: provider).0 }
     static func claudeTwoSecret(_ repo: AccountRepository, _ account: SavedAccount) -> Data { try! repo.secret(account).credentials }
     static func tryRead(_ vault: MemoryVault, _ repo: AccountRepository) -> Data? { try! vault.read(repo.claudeService(directory: nil), repo.user) }
+    static func claudeKeychainTests() throws {
+        let service = "Claude Code-credentials-test"
+        let data = Data("{\"claudeAiOauth\":{\"accessToken\":\"test-token\"}}\n".utf8)
+        let reader = ClaudeKeychain { arguments, input in
+            assert(arguments == ["find-generic-password", "-s", service, "-a", "test-user", "-w"])
+            assert(input == nil)
+            return (0, data + Data([10]))
+        }
+        let captured = try reader.read(service, "test-user")
+        assert(captured == data, "only the newline appended by security is removed")
+        let unicode = Data("{\"label\":\"日本語\"}".utf8)
+        let hexReader = ClaudeKeychain { _, _ in
+            (0, Data((unicode.map { String(format: "%02x", $0) }.joined() + "\n").utf8))
+        }
+        let decoded = try hexReader.read(service, "test-user")
+        assert(decoded == unicode, "security's hex output preserves non-ASCII credentials")
+        let missing = ClaudeKeychain { _, _ in (44, Data()) }
+        let absent = try missing.read(service, "test-user")
+        assert(absent == nil)
+        try missing.remove(service, "test-user")
+        let command = ClaudeKeychain.writeCommand(data, service, "test-user")!
+        let writer = ClaudeKeychain { arguments, input in
+            assert(arguments == ["-i"], "credentials never appear in process arguments")
+            assert(input == command)
+            return (0, Data())
+        }
+        try writer.write(command)
+        for status: Int32 in [1, errSecAuthFailed & 255, errSecUserCanceled & 255, errSecInteractionNotAllowed & 255] {
+            let denied = ClaudeKeychain { _, _ in (status, Data()) }
+            do { _ = try denied.read(service, "test-user"); fatalError("failed read treated as missing login") } catch {}
+            do { try denied.write(command); fatalError("failed write accepted") } catch {}
+            do { try denied.remove(service, "test-user"); fatalError("failed removal accepted") } catch {}
+        }
+        assert(ClaudeKeychain.writeCommand(Data(repeating: 65, count: 3000), service, "test-user") == nil, "large credentials are not truncated by security's input buffer")
+        assert(ClaudeKeychain.writeCommand(data, service, "test\"\nquit") == nil, "interactive command injection is rejected")
+        assert(!ClaudeKeychain.handles("ccs Accounts") && !ClaudeKeychain.handles("SessionSpot Accounts"), "saved account vaults retain their native Keychain access")
+    }
+    static func claudeKeychainIntegrationTest() throws {
+        // Only touch a fresh test item, never Claude Code's real login.
+        let vault = KeychainVault()
+        let service = "Claude Code-credentials-ccs-test-\(UUID().uuidString)"
+        let account = "ccs-test"
+        defer { try? vault.remove(service, account) }
+        let original = Data("{\"claudeAiOauth\":{\"accessToken\":\"dummy-one\"}}".utf8)
+        let updated = Data("{\"claudeAiOauth\":{\"accessToken\":\"dummy-two\"},\"label\":\"日本語\"}".utf8)
+        try vault.write(original, service, account)
+        let firstRead = try vault.read(service, account)
+        guard firstRead == original else { throw AccountError.message("security could not read the dummy credentials") }
+        try vault.write(updated, service, account)
+        let secondRead = try vault.read(service, account)
+        guard secondRead == updated else { throw AccountError.message("switch did not preserve dummy UTF-8 credentials") }
+        try vault.remove(service, account)
+        let removed = try vault.read(service, account)
+        guard removed == nil else { throw AccountError.message("dummy Keychain item was not removed") }
+        print("Claude Keychain integration passed using a disposable dummy item.")
+    }
 }
