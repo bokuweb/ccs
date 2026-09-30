@@ -395,6 +395,82 @@ enum ClaudeDesktopLauncher {
     }
 }
 
+// Desktop scopes the Code list by account/org, while local CLI transcripts are
+// shared in ~/.claude/projects. Copy only portable index metadata, never login,
+// connector configuration, tool grants, or cloud/SSH execution state.
+final class ClaudeDesktopCodeHistory {
+    let repository: AccountRepository
+    var directory: URL { repository.home.appendingPathComponent("Library/Application Support/Claude/claude-code-sessions") }
+    static let fields: Set<String> = [
+        "sessionId", "cliSessionId", "cwd", "originCwd", "worktreePath", "worktreeName",
+        "createdAt", "lastActivityAt", "lastFocusedAt", "title", "titleSource", "previousTitles",
+        "model", "effort", "isArchived", "branch", "sourceBranch", "writtenBranches",
+        "completedTurns", "titleTurn", "lastAssistantUuid", "postTurnSummary", "postTurnSummaryFor",
+        "forkedFromSessionId", "forkedAtMessageUuid", "priorCliSessionIds", "rewindEdges",
+        "transcriptModelStates", "transcriptCuts"
+    ]
+    init(repository: AccountRepository) { self.repository = repository }
+    func folder(_ account: SavedAccount) throws -> URL {
+        let parts = account.identity.split(separator: ":")
+        guard parts.count == 2, let org = UUID(uuidString: String(parts[1])) else {
+            throw AccountError.message("Invalid Claude Code history account identity.")
+        }
+        return directory.appendingPathComponent(try ClaudeDesktopSessions.uuid(account)).appendingPathComponent(org.uuidString.lowercased())
+    }
+    private func regular(_ url: URL) -> Bool {
+        let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        return values?.isRegularFile == true && values?.isSymbolicLink != true
+    }
+    private func read(_ url: URL) -> [String: Any]? {
+        guard regular(url), let data = try? Data(contentsOf: url), let json = try? repository.object(data),
+              let id = json["sessionId"] as? String, id == url.deletingPathExtension().lastPathComponent,
+              id.hasPrefix("local_"), UUID(uuidString: String(id.dropFirst(6))) != nil,
+              let cli = json["cliSessionId"] as? String, UUID(uuidString: cli) != nil,
+              let cwd = json["cwd"] as? String, cwd.hasPrefix("/"),
+              json["sshConfig"] == nil, json["wslConfig"] == nil,
+              json["cloudSessionId"] == nil, json["movedToCloud"] == nil,
+              let created = json["createdAt"] as? Double, created.isFinite,
+              let activity = json["lastActivityAt"] as? Double, activity.isFinite else { return nil }
+        return json
+    }
+    // Call only while Desktop is stopped so its shutdown flush cannot race us.
+    @discardableResult func synchronize(to account: SavedAccount, accounts: [SavedAccount]) throws -> Int {
+        let target = try folder(account)
+        var newest: [String: [String: Any]] = [:]
+        for source in accounts where source.provider == .claude && source.identity != account.identity {
+            guard let folder = try? folder(source), folder.resolvingSymlinksInPath().path == folder.standardizedFileURL.path else { continue }
+            if !FileManager.default.fileExists(atPath: folder.path) { continue }
+            for file in try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil).sorted(by: { $0.path < $1.path }) where file.pathExtension == "json" {
+                guard let json = read(file) else { continue }
+                let key = file.lastPathComponent
+                if let old = newest[key], (old["lastActivityAt"] as! Double) >= (json["lastActivityAt"] as! Double) { continue }
+                newest[key] = json
+            }
+        }
+        guard target.resolvingSymlinksInPath().path == target.standardizedFileURL.path else {
+            throw AccountError.message("Cannot share Code history through a symbolic link.")
+        }
+        let backup = repository.root.appendingPathComponent("claude-desktop/history-backups/\(UUID().uuidString)")
+        var count = 0
+        for name in newest.keys.sorted() {
+            let source = newest[name]!
+            let destination = target.appendingPathComponent(name)
+            var merged: [String: Any] = [:]
+            if FileManager.default.fileExists(atPath: destination.path) {
+                // Keep unreadable/unsupported target records intact.
+                guard let existing = read(destination),
+                      (source["lastActivityAt"] as! Double) > (existing["lastActivityAt"] as! Double) else { continue }
+                merged = existing
+                try repository.secureWrite(Data(contentsOf: destination), to: backup.appendingPathComponent(name))
+            }
+            for field in Self.fields { merged[field] = source[field] }
+            try repository.secureWrite(repository.encode(merged), to: destination)
+            count += 1
+        }
+        return count
+    }
+}
+
 final class AccountRepository {
     let home: URL
     let root: URL
@@ -855,6 +931,7 @@ final class AccountRepository {
                 stopped = true
                 let connected = try sessions.capture()
                 try sessions.save(connected, account: account)
+                try ClaudeDesktopCodeHistory(repository: repository).synchronize(to: account, accounts: accounts)
                 try ClaudeDesktopLauncher.launch(app)
                 stopped = false
                 try repository.activate(account, accounts: &accounts)

@@ -4,6 +4,7 @@ import ServiceManagement
 import SwiftUI
 
 private enum MiniStyle {
+    static let accountRowHeight: CGFloat = 72
     static let accent = Color(red: 0.34, green: 0.64, blue: 1.0)
     static let active = Color(red: 0.38, green: 0.84, blue: 0.59)
     static let panelTop = Color(red: 0.17, green: 0.18, blue: 0.20)
@@ -109,27 +110,28 @@ private struct MiniAccountRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(account.name)
-                HStack(spacing: 5) {
-                    if isActive {
+                if isActive {
+                    HStack(spacing: 5) {
                         Circle().fill(MiniStyle.active).frame(width: 6, height: 6)
                         Text(activeLabel)
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(MiniStyle.active)
-                    }
-                    Group {
-                        Button(isActive ? (account.provider == .codex ? "Restart Desktop" : "Switch Desktop") : "Switch") { model.activate(account, refreshUsage: false) }
-                            .font(.system(size: 10, weight: .medium))
-                            .buttonStyle(.plain)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(.white.opacity(0.07), in: Capsule())
-                            .overlay(Capsule().stroke(.white.opacity(0.13), lineWidth: 0.5))
-                            .disabled(model.switchingCodex || model.switchingClaude)
-                            .contextMenu {
-                                if account.provider == .claude { Button("Reconnect Desktop…") { model.reconnectClaudeDesktop(account) } }
-                            }
+                            .lineLimit(1)
                     }
                 }
+                Button(isActive ? (account.provider == .codex ? "Restart Desktop" : "Switch Desktop") : "Switch") { model.activate(account, refreshUsage: false) }
+                    .font(.system(size: 10, weight: .medium))
+                    .buttonStyle(.plain)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(.white.opacity(0.07), in: Capsule())
+                    .overlay(Capsule().stroke(.white.opacity(0.13), lineWidth: 0.5))
+                    .disabled(model.switchingCodex || model.switchingClaude)
+                    .contextMenu {
+                        if account.provider == .claude { Button("Reconnect Desktop…") { model.reconnectClaudeDesktop(account) } }
+                    }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -158,7 +160,7 @@ private struct MiniAccountRow: View {
             }
         }
         .padding(.horizontal, 9)
-        .frame(height: 59)
+        .frame(height: MiniStyle.accountRowHeight)
         .background {
             RoundedRectangle(cornerRadius: 8)
                 .fill(LinearGradient(colors: [.white.opacity(isActive ? 0.085 : 0.065),
@@ -188,7 +190,7 @@ private struct MiniView: View {
         let rowCount = max(2, accounts.accounts.count)
         let rowGaps = max(0, accounts.accounts.count - 2)
         let messageHeight: CGFloat = accounts.signingIn != nil || !accounts.message.isEmpty ? 38 : 0
-        return min(500, CGFloat(16 + 46 + 10 + rowCount * 59 + rowGaps * 5) + messageHeight)
+        return min(500, CGFloat(16 + 46 + 10 + rowGaps * 5) + CGFloat(rowCount) * MiniStyle.accountRowHeight + messageHeight)
     }
 
     var body: some View {
@@ -228,7 +230,7 @@ private struct MiniView: View {
                                     .font(.system(size: 11))
                                     .foregroundStyle(.secondary)
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                                    .frame(height: 59)
+                                    .frame(height: MiniStyle.accountRowHeight)
                             } else {
                                 VStack(spacing: 5) {
                                     ForEach(saved) { account in

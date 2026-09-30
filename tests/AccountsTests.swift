@@ -25,6 +25,64 @@ final class UsageURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 @main struct AccountsTests {
+    static func desktopCodeHistoryTests() throws {
+        let home = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let repository = AccountRepository(home: home, vault: MemoryVault())
+        let history = ClaudeDesktopCodeHistory(repository: repository)
+        let one = SavedAccount(id: "one", provider: .claude, identity: "11111111-1111-1111-1111-111111111111:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", name: "one")
+        let two = SavedAccount(id: "two", provider: .claude, identity: "22222222-2222-2222-2222-222222222222:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", name: "two")
+        let third = SavedAccount(id: "third", provider: .claude, identity: "33333333-3333-3333-3333-333333333333:cccccccc-cccc-cccc-cccc-cccccccccccc", name: "third")
+        let id = "local_\(UUID().uuidString.lowercased())", cli = UUID().uuidString.lowercased()
+        var record: [String: Any] = ["sessionId": id, "cliSessionId": cli, "cwd": "/project", "createdAt": 1, "lastActivityAt": 2, "title": "original", "permissionMode": "bypassPermissions", "remoteMcpServersConfig": ["token": "private"], "sessionPermissionUpdates": ["allow"], "bridgeSessionIds": ["private"]]
+        let original = try history.folder(one).appendingPathComponent("\(id).json")
+        let shared = try history.folder(two).appendingPathComponent("\(id).json")
+        try repository.secureWrite(repository.encode(record), to: original)
+        let transcript = home.appendingPathComponent(".claude/projects/-project/\(cli).jsonl")
+        let transcriptData = Data("conversation\n".utf8)
+        try repository.secureWrite(transcriptData, to: transcript)
+        let initial = try Data(contentsOf: original)
+        let added = try history.synchronize(to: two, accounts: [one, two])
+        assert(added == 1)
+        var copy = try repository.object(Data(contentsOf: shared))
+        assert(copy["cliSessionId"] as? String == cli && copy["cwd"] as? String == "/project")
+        for key in ["permissionMode", "remoteMcpServersConfig", "sessionPermissionUpdates", "bridgeSessionIds"] { assert(copy[key] == nil) }
+        assert(try! Data(contentsOf: original) == initial)
+        assert(try! Data(contentsOf: transcript) == transcriptData)
+        assert((try! FileManager.default.attributesOfItem(atPath: shared.path)[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        let repeated = try history.synchronize(to: two, accounts: [one, two]); assert(repeated == 0)
+        copy["title"] = "continued on two"; copy["lastActivityAt"] = 3
+        copy["remoteMcpServersConfig"] = ["token": "two-private"]
+        try repository.secureWrite(repository.encode(copy), to: shared)
+        let updated = try history.synchronize(to: one, accounts: [one, two]); assert(updated == 1)
+        let back = try repository.object(Data(contentsOf: original))
+        assert(back["title"] as? String == "continued on two")
+        assert((back["remoteMcpServersConfig"] as? [String: String])?["token"] == "private", "preserve target account's connector configuration")
+        let backups = FileManager.default.enumerator(at: repository.root.appendingPathComponent("claude-desktop/history-backups"), includingPropertiesForKeys: nil)!
+        let backup = backups.compactMap { $0 as? URL }.first { $0.lastPathComponent == "\(id).json" }!
+        assert(try! Data(contentsOf: backup) == initial)
+        // Cloud/SSH records, malformed identities, symlinks and unrelated accounts
+        // must not be used as local history sources.
+        for marker in ["cloudSessionId", "sshConfig", "wslConfig", "movedToCloud"] {
+            let otherID = "local_\(UUID().uuidString.lowercased())"
+            var remote = record; remote["sessionId"] = otherID; remote[marker] = "remote"
+            try repository.secureWrite(repository.encode(remote), to: history.folder(one).appendingPathComponent("\(otherID).json"))
+        }
+        record["title"] = "unregistered"; record["lastActivityAt"] = 99
+        try repository.secureWrite(repository.encode(record), to: history.folder(third).appendingPathComponent("\(id).json"))
+        try repository.secureWrite(Data("broken".utf8), to: history.folder(one).appendingPathComponent("local_bad.json"))
+        let externalID = "local_\(UUID().uuidString.lowercased())"
+        record["sessionId"] = externalID
+        let external = home.appendingPathComponent("external.json")
+        try repository.secureWrite(repository.encode(record), to: external)
+        try FileManager.default.createSymbolicLink(at: history.folder(one).appendingPathComponent("\(externalID).json"), withDestinationURL: external)
+        let ignored = try history.synchronize(to: two, accounts: [one, two]); assert(ignored == 0)
+        assert(try! FileManager.default.contentsOfDirectory(atPath: history.folder(two).path).count == 1)
+        // Never replace a damaged target record or roll back a newer record.
+        try repository.secureWrite(Data("retain me".utf8), to: shared)
+        let retained = try history.synchronize(to: two, accounts: [one, two]); assert(retained == 0)
+        assert(try! Data(contentsOf: shared) == Data("retain me".utf8))
+    }
     static func desktopSessionTests() throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: home) }
@@ -94,6 +152,7 @@ final class UsageURLProtocol: URLProtocol {
     static func tryCapture(_ sessions: ClaudeDesktopSessions) -> ClaudeDesktopSession { try! sessions.capture() }
 
     static func main() async throws {
+        try desktopCodeHistoryTests()
         try desktopSessionTests()
         try claudeKeychainTests()
         if CommandLine.arguments.contains("--keychain-integration") { try claudeKeychainIntegrationTest() }
