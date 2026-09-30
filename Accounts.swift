@@ -205,133 +205,6 @@ enum CodexDesktopLauncher {
     }
 }
 
-// Claude Desktop keeps its own Electron login, separate from Claude Code's
-// Keychain credentials. Keep each Desktop profile intact and select it before
-// reopening the app. Moving directories on the same volume is atomic and
-// avoids copying browser cookies or token caches into ccs metadata.
-struct ClaudeDesktopProfiles {
-    let repository: AccountRepository
-    var desktop: URL { repository.home.appendingPathComponent("Library/Application Support/Claude") }
-    var root: URL { repository.root.appendingPathComponent("claude-desktop") }
-    var profiles: URL { root.appendingPathComponent("profiles") }
-    var selection: URL { root.appendingPathComponent("selected.json") }
-
-    func desktopUUID() -> String? {
-        let config = desktop.appendingPathComponent("config.json")
-        guard let data = try? Data(contentsOf: config),
-              let object = try? repository.object(data),
-              let value = object["lastKnownAccountUuid"] as? String,
-              UUID(uuidString: value) != nil else { return nil }
-        return value.lowercased()
-    }
-
-    func selectedID() -> String? {
-        guard let data = try? Data(contentsOf: selection),
-              let object = try? repository.object(data),
-              let value = object["accountID"] as? String,
-              UUID(uuidString: value) != nil else { return nil }
-        return value
-    }
-
-    func accountUUID(_ account: SavedAccount) -> String? {
-        let value = String(account.identity.split(separator: ":", omittingEmptySubsequences: false).first ?? "")
-        return UUID(uuidString: value)?.uuidString.lowercased()
-    }
-
-    func currentSlot(accounts: [SavedAccount]) -> String? {
-        if let uuid = desktopUUID() {
-            return accounts.first(where: { $0.provider == .claude && accountUUID($0) == uuid })?.id ?? "unmanaged-\(uuid)"
-        }
-        return selectedID()
-    }
-
-    // Returns whether the selected Desktop profile already has this login.
-    @discardableResult func select(_ account: SavedAccount, accounts: [SavedAccount]) throws -> Bool {
-        guard account.provider == .claude, UUID(uuidString: account.id) != nil else {
-            throw AccountError.message("Invalid Claude account record.")
-        }
-        guard let targetUUID = accountUUID(account) else {
-            throw AccountError.message("This Claude Code account has no Desktop-compatible account ID. Sign in to Claude Code again and reimport it.")
-        }
-        let files = FileManager.default
-        let current = currentSlot(accounts: accounts)
-        if current == account.id { return desktopUUID() == targetUUID }
-        let target = profiles.appendingPathComponent(account.id, isDirectory: true)
-        let outgoing = current.map { profiles.appendingPathComponent($0, isDirectory: true) }
-            ?? profiles.appendingPathComponent("unassigned-\(UUID().uuidString)", isDirectory: true)
-        let hasDesktop = files.fileExists(atPath: desktop.path)
-        let hasTarget = files.fileExists(atPath: target.path)
-        if hasDesktop && files.fileExists(atPath: outgoing.path) {
-            throw AccountError.message("A saved Claude Desktop profile already occupies this account's slot. No login data was changed.")
-        }
-        if hasTarget {
-            let config = target.appendingPathComponent("config.json")
-            if let data = try? Data(contentsOf: config),
-               let object = try? repository.object(data),
-               let uuid = object["lastKnownAccountUuid"] as? String,
-               uuid.lowercased() != targetUUID {
-                throw AccountError.message("The saved Claude Desktop login does not match this Claude Code account. No login data was changed.")
-            }
-        }
-        try files.createDirectory(at: profiles, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let oldSelection = try? Data(contentsOf: selection)
-        var movedOutgoing = false
-        var movedTarget = false
-        var createdEmpty = false
-        do {
-            if hasDesktop {
-                try files.moveItem(at: desktop, to: outgoing)
-                movedOutgoing = true
-            }
-            if hasTarget {
-                try files.moveItem(at: target, to: desktop)
-                movedTarget = true
-            } else {
-                try files.createDirectory(at: desktop, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
-                createdEmpty = true
-            }
-            try repository.secureWrite(repository.encode(["accountID": account.id]), to: selection)
-        } catch {
-            do {
-                if createdEmpty { try files.removeItem(at: desktop) }
-                if movedTarget { try files.moveItem(at: desktop, to: target) }
-                if movedOutgoing { try files.moveItem(at: outgoing, to: desktop) }
-                if let oldSelection { try repository.secureWrite(oldSelection, to: selection) }
-                else if files.fileExists(atPath: selection.path) { try files.removeItem(at: selection) }
-            } catch {
-                throw AccountError.message("Claude Desktop profile switch and rollback failed. Profiles are preserved in \(profiles.path). Close Claude Desktop and inspect them before retrying.")
-            }
-            throw error
-        }
-        return hasTarget && desktopUUID() == targetUUID
-    }
-}
-
-enum ClaudeDesktopLauncher {
-    static func stop(_ applications: [NSRunningApplication]) throws {
-        for application in applications where !application.isTerminated {
-            guard application.terminate() else { throw AccountError.message("Could not close Claude Desktop. Close it and retry.") }
-        }
-        let deadline = Date().addingTimeInterval(20)
-        while applications.contains(where: { !$0.isTerminated }) && Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }
-        guard applications.allSatisfy(\.isTerminated) else {
-            throw AccountError.message("Claude Desktop is still open. Finish its current work, then retry switching.")
-        }
-    }
-    static func launch(app: URL) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        process.arguments = [app.path]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            throw AccountError.message("macOS could not reopen Claude Desktop (open exited \(process.terminationStatus)).")
-        }
-    }
-}
-
 final class AccountRepository {
     let home: URL
     let root: URL
@@ -612,7 +485,6 @@ final class AccountRepository {
     @Published var loadingUsage: Set<String> = []
     @Published var signingIn: AccountProvider?
     @Published var switchingCodex = false
-    @Published var switchingClaude = false
     let repository: AccountRepository
     private var loginTask: Task<Void, Never>?
     private var nextAutomaticUsageRequest: [String: Date] = [:]
@@ -715,52 +587,12 @@ final class AccountRepository {
                     }
                 }
             } else {
-                guard !switchingClaude else { return }
-                guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.anthropic.claudefordesktop") else {
-                    try repository.activate(account, accounts: &accounts)
-                    active[.claude] = account.id
-                    message = "Claude Code switched to \(account.name)."
-                    if refreshUsage { refresh() }
-                    return
-                }
-                let saved = try repository.secret(account)
-                guard try repository.identity(saved, provider: .claude).0 == account.identity else {
-                    throw AccountError.message("Account identity mismatch. Sign in again.")
-                }
-                let running = NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == "com.anthropic.claudefordesktop" }
-                let profiles = ClaudeDesktopProfiles(repository: repository)
-                let previous = accounts.first { $0.id == profiles.currentSlot(accounts: accounts) }
-                switchingClaude = true
-                message = "Switching Claude Desktop to \(account.name)…"
-                Task {
-                    defer { switchingClaude = false }
-                    var stopped = false
-                    var changedProfile = false
-                    do {
-                        try await Task.detached { try ClaudeDesktopLauncher.stop(running) }.value
-                        stopped = true
-                        let targetAlreadySelected = profiles.currentSlot(accounts: accounts) == account.id
-                        let signedIn = try profiles.select(account, accounts: accounts)
-                        changedProfile = !targetAlreadySelected
-                        do {
-                            try repository.activate(account, accounts: &accounts)
-                        } catch {
-                            if changedProfile, let previous {
-                                _ = try? profiles.select(previous, accounts: accounts)
-                            }
-                            throw error
-                        }
-                        active[.claude] = account.id
-                        try await Task.detached { try ClaudeDesktopLauncher.launch(app: app) }.value
-                        message = signedIn
-                            ? "Claude Code and Desktop switched to \(account.name)."
-                            : "Claude Code switched to \(account.name). Sign in to this account in Claude Desktop once; ccs will keep that login for future switches."
-                        if refreshUsage { refresh() }
-                    } catch {
-                        if stopped { try? await Task.detached { try ClaudeDesktopLauncher.launch(app: app) }.value }
-                        message = error.localizedDescription
-                    }
-                }
+                // Desktop has separate authentication and stores local history in its
+                // application support directory. Code switching must never move it.
+                try repository.activate(account, accounts: &accounts)
+                active[.claude] = account.id
+                message = "Claude Code switched to \(account.name). Claude Desktop uses its own login."
+                if refreshUsage { refresh() }
             }
         } catch { message = error.localizedDescription }
     }
@@ -882,7 +714,7 @@ struct AccountsView: View {
                 if model.refreshing { ProgressView().controlSize(.small) }
                 Button { model.refresh() } label: { Image(systemName: "arrow.clockwise") }.disabled(model.refreshing)
             }
-            Text("Switch Codex CLI and Desktop with shared session history. Claude switches Code and Desktop; sign in to each Claude Desktop account once.")
+            Text("Switch Codex CLI and Desktop with shared session history. Claude switches Code only; manage Claude Desktop login in Desktop.")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
@@ -900,10 +732,12 @@ struct AccountsView: View {
                                         Text(account.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
                                         Spacer()
                                         if model.active[provider] == account.id {
-                                            Label("Active", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                                            Button("Restart Desktop") { model.activate(account) }.disabled(model.switchingCodex || model.switchingClaude)
+                                            Label(provider == .claude ? "Code active" : "Active", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                                            if provider == .codex {
+                                                Button("Restart Desktop") { model.activate(account) }.disabled(model.switchingCodex)
+                                            }
                                         } else {
-                                            Button("Switch") { model.activate(account) }.disabled(model.switchingCodex || model.switchingClaude)
+                                            Button(provider == .claude ? "Switch Code" : "Switch") { model.activate(account) }.disabled(model.switchingCodex)
                                         }
                                         Button { removing = account } label: { Image(systemName: "trash") }.buttonStyle(.plain).foregroundStyle(.secondary)
                                     }

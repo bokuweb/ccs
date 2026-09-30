@@ -114,30 +114,44 @@ final class UsageURLProtocol: URLProtocol {
         let restoredFallback = try Data(contentsOf: root.appendingPathComponent(".claude/.credentials.json"))
         assert(restoredFallback == refreshedClaude, "failed switch restores fallback credentials")
         try FileManager.default.removeItem(at: root.appendingPathComponent(".claude.json"))
-        let desktopOneUUID = UUID().uuidString.lowercased()
-        let desktopTwoUUID = UUID().uuidString.lowercased()
-        let desktopOne = SavedAccount(id: UUID().uuidString, provider: .claude, identity: "\(desktopOneUUID):org", name: "first")
-        let desktopTwo = SavedAccount(id: UUID().uuidString, provider: .claude, identity: "\(desktopTwoUUID):org", name: "second")
-        let desktopProfiles = ClaudeDesktopProfiles(repository: repository)
-        try repository.secureWrite(repository.encode(["lastKnownAccountUuid": desktopOneUUID]), to: desktopProfiles.desktop.appendingPathComponent("config.json"))
-        try repository.secureWrite(Data("first-profile".utf8), to: desktopProfiles.desktop.appendingPathComponent("sentinel"))
-        let needsSignIn = try desktopProfiles.select(desktopTwo, accounts: [desktopOne, desktopTwo])
-        assert(!needsSignIn, "new Desktop login needs sign-in")
-        assert(desktopProfiles.selectedID() == desktopTwo.id)
-        let firstSaved = try String(contentsOf: desktopProfiles.profiles.appendingPathComponent("\(desktopOne.id)/sentinel"), encoding: .utf8)
-        assert(firstSaved == "first-profile")
-        try repository.secureWrite(repository.encode(["lastKnownAccountUuid": desktopTwoUUID]), to: desktopProfiles.desktop.appendingPathComponent("config.json"))
-        try repository.secureWrite(Data("second-profile".utf8), to: desktopProfiles.desktop.appendingPathComponent("sentinel"))
-        let restoredLogin = try desktopProfiles.select(desktopOne, accounts: [desktopOne, desktopTwo])
-        assert(restoredLogin, "saved Desktop login is restored")
-        assert(desktopProfiles.desktopUUID() == desktopOneUUID)
-        let firstRestored = try String(contentsOf: desktopProfiles.desktop.appendingPathComponent("sentinel"), encoding: .utf8)
-        let secondSaved = try String(contentsOf: desktopProfiles.profiles.appendingPathComponent("\(desktopTwo.id)/sentinel"), encoding: .utf8)
-        assert(firstRestored == "first-profile" && secondSaved == "second-profile")
-        let wrongUUID = UUID().uuidString.lowercased()
-        try repository.secureWrite(repository.encode(["lastKnownAccountUuid": wrongUUID]), to: desktopProfiles.profiles.appendingPathComponent("\(desktopTwo.id)/config.json"))
-        do { _ = try desktopProfiles.select(desktopTwo, accounts: [desktopOne, desktopTwo]); fatalError("mismatched Desktop profile accepted") } catch {}
-        assert(desktopProfiles.desktopUUID() == desktopOneUUID, "mismatch leaves current Desktop profile untouched")
+        try repository.secureWrite(repository.encode(after), to: root.appendingPathComponent(".claude.json"))
+        // Exercise the same model action used by mini. Local Desktop state must
+        // stay intact across Code switches, reactivation, and failed switches.
+        let desktop = root.appendingPathComponent("Library/Application Support/Claude")
+        let legacyProfiles = repository.root.appendingPathComponent("claude-desktop")
+        let desktopFiles = [
+            desktop.appendingPathComponent("config.json"): try repository.encode(["lastKnownAccountUuid": UUID().uuidString]),
+            desktop.appendingPathComponent("Local Storage/leveldb/history.ldb"): Data("existing chat history".utf8),
+            desktop.appendingPathComponent("LocalAgentModeSessions/session.json"): Data("existing Code session".utf8),
+            desktop.appendingPathComponent("Cookies"): Data("existing Desktop login".utf8),
+            legacyProfiles.appendingPathComponent("profiles/old-account/history"): Data("recoverable history".utf8),
+            legacyProfiles.appendingPathComponent("selected.json"): Data("legacy selection".utf8)
+        ]
+        for (url, data) in desktopFiles { try repository.secureWrite(data, to: url) }
+        let desktopInode = try FileManager.default.attributesOfItem(atPath: desktop.path)[.systemFileNumber] as? NSNumber
+        try await MainActor.run {
+            let model = AccountsModel(repository: repository)
+            for target in [claudeOne, claudeTwo, claudeTwo, claudeOne] {
+                model.activate(target, refreshUsage: false)
+                assert(model.active[.claude] == target.id, "Code switch finishes without a Desktop restart")
+                assert(tryIdentity(repository, .claude) == target.identity)
+                assert(model.message.contains("Claude Code switched"))
+                for (url, data) in desktopFiles {
+                    let actual = try Data(contentsOf: url)
+                    assert(actual == data, "Code switch preserves Desktop history, login, and recovery copies")
+                }
+            }
+            let mismatch = SavedAccount(id: claudeTwo.id, provider: .claude, identity: "wrong", name: "wrong")
+            model.activate(mismatch, refreshUsage: false)
+            assert(model.active[.claude] == claudeOne.id)
+            assert(model.message.contains("identity mismatch"))
+            for (url, data) in desktopFiles {
+                let actual = try Data(contentsOf: url)
+                assert(actual == data, "failed Code switch preserves Desktop data")
+            }
+        }
+        let desktopInodeAfter = try FileManager.default.attributesOfItem(atPath: desktop.path)[.systemFileNumber] as? NSNumber
+        assert(desktopInode == desktopInodeAfter, "Desktop directory is never replaced")
         let usage = AccountRepository.parseUsage(["rate_limit": ["primary_window": ["used_percent": 28, "limit_window_seconds": 18000, "reset_at": 1900000000]]], provider: .codex)
         assert(usage.count == 1 && usage[0].used == 28 && usage[0].label == "5 hours")
         assert(AccountRepository.parseUsage(["rate_limit": ["primary_window": [:]]], provider: .codex).isEmpty, "missing usage is not zero")
@@ -190,7 +204,7 @@ final class UsageURLProtocol: URLProtocol {
         assert(claudeKeychainReads == 0, "usage refresh does not read Claude Code Keychain")
         let fallbackRefresh = try repository.object(Data(contentsOf: root.appendingPathComponent(".claude/.credentials.json")))["claudeAiOauth"] as! [String: Any]
         assert(fallbackRefresh["accessToken"] as? String == "renewed", "matching file credentials receive refreshed token")
-        print("Account tests passed: switching, token preservation, Claude Desktop profiles, usage parsing, Claude OAuth refresh and retry.")
+        print("Account tests passed: switching, token preservation, Claude Desktop history preservation, usage parsing, Claude OAuth refresh and retry.")
     }
     static func tryIdentity(_ repo: AccountRepository, _ provider: AccountProvider) -> String { try! repo.identity(repo.capture(provider)!, provider: provider).0 }
     static func claudeTwoSecret(_ repo: AccountRepository, _ account: SavedAccount) -> Data { try! repo.secret(account).credentials }
