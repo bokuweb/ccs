@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import ServiceManagement
 import SwiftUI
 
 private enum MiniStyle {
@@ -269,6 +270,7 @@ private final class MiniPanel: NSPanel {
 }
 
 @MainActor private final class MiniDelegate: NSObject, NSApplicationDelegate {
+    private let loginItemConfiguredKey = "miniLaunchAtLoginConfigured"
     private var status: NSStatusItem!
     private var panel: MiniPanel!
     private var outsideClickMonitor: Any?
@@ -278,6 +280,7 @@ private final class MiniPanel: NSPanel {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        configureLoginItemOnFirstLaunch()
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         status.button?.image = MiniMenuBarIcon.makeImage()
         status.button?.toolTip = "ccs mini: usage and accounts"
@@ -304,6 +307,15 @@ private final class MiniPanel: NSPanel {
         if NSApp.currentEvent?.type == .rightMouseUp {
             hidePanel()
             let menu = NSMenu()
+            let serviceStatus = SMAppService.mainApp.status
+            let loginItem = menu.addItem(withTitle: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+            loginItem.target = self
+            loginItem.state = serviceStatus == .enabled || serviceStatus == .requiresApproval ? .on : .off
+            loginItem.isEnabled = !isRunningFromDiskImage
+            if serviceStatus == .requiresApproval {
+                menu.addItem(withTitle: "Allow in System Settings…", action: #selector(openLoginItemSettings), keyEquivalent: "").target = self
+            }
+            menu.addItem(.separator())
             menu.addItem(withTitle: "Quit ccs mini", action: #selector(quit), keyEquivalent: "q").target = self
             if let button = status.button { menu.popUp(positioning: nil, at: .zero, in: button) }
             return
@@ -316,6 +328,46 @@ private final class MiniPanel: NSPanel {
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
+
+    private var isRunningFromDiskImage: Bool {
+        (try? Bundle.main.bundleURL.resourceValues(forKeys: [.volumeIsReadOnlyKey]))?.volumeIsReadOnly == true
+    }
+
+    private func configureLoginItemOnFirstLaunch() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: loginItemConfiguredKey), !isRunningFromDiskImage else { return }
+        let service = SMAppService.mainApp
+        guard service.status != .notFound else { return }
+        if service.status == .notRegistered {
+            do { try service.register() }
+            catch {
+                NSLog("ccs mini: Could not enable Launch at Login: %@", error.localizedDescription)
+                return
+            }
+        }
+        defaults.set(true, forKey: loginItemConfiguredKey)
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled || service.status == .requiresApproval {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+            UserDefaults.standard.set(true, forKey: loginItemConfiguredKey)
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Could not change Launch at Login"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+    }
+
+    @objc private func openLoginItemSettings() {
+        SMAppService.openSystemSettingsLoginItems()
+    }
 
     private func showPanel() {
         guard let button = status.button, let buttonWindow = button.window else { return }

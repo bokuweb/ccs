@@ -97,7 +97,11 @@ jobs:
           xcrun stapler validate "$CCS_OUTPUT_DIR/$APP_NAME.app"
           ditto -c -k --sequesterRsrc --keepParent "$CCS_OUTPUT_DIR/$APP_NAME.app" "$CCS_OUTPUT_DIR/$APP_NAME.zip"
           spctl --assess --type execute --verbose "$CCS_OUTPUT_DIR/$APP_NAME.app"
-          hdiutil create -volname "$APP_NAME" -srcfolder "$CCS_OUTPUT_DIR/$APP_NAME.app" \
+          dmg_root="$RUNNER_TEMP/$APP_NAME-dmg-root"
+          mkdir -p "$dmg_root"
+          ditto "$CCS_OUTPUT_DIR/$APP_NAME.app" "$dmg_root/$APP_NAME.app"
+          ln -s /Applications "$dmg_root/Applications"
+          hdiutil create -volname "$APP_NAME" -srcfolder "$dmg_root" \
             -format UDZO "$CCS_OUTPUT_DIR/$APP_NAME.dmg"
           xcrun notarytool submit "$CCS_OUTPUT_DIR/$APP_NAME.dmg" \
             --apple-id "$APPLE_ID" \

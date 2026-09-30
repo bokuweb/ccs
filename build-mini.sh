@@ -21,7 +21,7 @@ for size in 16 32 128 256 512; do
     sips -z "$doubled" "$doubled" "$build_dir/icon.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/ccs.icns"
-swiftc -parse-as-library -O -framework AppKit -framework SwiftUI -framework Security Mini.swift Accounts.swift -o "$app/Contents/MacOS/ccs-mini"
+swiftc -parse-as-library -O -framework AppKit -framework SwiftUI -framework Security -framework ServiceManagement Mini.swift Accounts.swift -o "$app/Contents/MacOS/ccs-mini"
 xattr -cr "$app"
 if [ -n "${CCS_CODESIGN_IDENTITY:-}" ]; then
     codesign --force --options runtime --timestamp --sign "$CCS_CODESIGN_IDENTITY" "$app"
