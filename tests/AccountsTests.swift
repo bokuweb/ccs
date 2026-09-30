@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import SQLite3
 
 final class MemoryVault: CredentialVault {
     var values: [String: Data] = [:]
@@ -24,7 +25,76 @@ final class UsageURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 @main struct AccountsTests {
+    static func desktopSessionTests() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let repository = AccountRepository(home: home, vault: MemoryVault())
+        let sessions = ClaudeDesktopSessions(repository: repository)
+        let one = SavedAccount(id: "one", provider: .claude, identity: "11111111-1111-1111-1111-111111111111:org", name: "one")
+        let two = SavedAccount(id: "two", provider: .claude, identity: "22222222-2222-2222-2222-222222222222:org", name: "two")
+        try repository.secureWrite(repository.encode(["lastKnownAccountUuid": try ClaudeDesktopSessions.uuid(one)]), to: sessions.directory.appendingPathComponent("config.json"))
+        let histories = ["Local Storage/leveldb/history", "IndexedDB/history", "claude-code-sessions/history", "local-agent-mode-sessions/history"]
+        for path in histories { try repository.secureWrite(Data(path.utf8), to: sessions.directory.appendingPathComponent(path)) }
+        let inode = try FileManager.default.attributesOfItem(atPath: sessions.directory.path)[.systemFileNumber] as? NSNumber
+        var db: OpaquePointer?
+        assert(sqlite3_open(sessions.directory.appendingPathComponent("Cookies").path, &db) == SQLITE_OK)
+        func sql(_ text: String) { assert(sqlite3_exec(db, text, nil, nil, nil) == SQLITE_OK) }
+        sql("CREATE TABLE cookies (host_key TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, encrypted_value BLOB NOT NULL, expires_utc INTEGER NOT NULL, UNIQUE(host_key,name))")
+        sql("INSERT INTO cookies VALUES ('.claude.ai','sessionKey','',x'7631301111',15000000000000000),('.claude.ai','lastActiveOrg','one',x'',15000000000000000),('.claude.ai','anthropic-device-id','device',x'',15000000000000000),('.example.com','sessionKey','unrelated',x'',15000000000000000)")
+        let original = try sessions.capture()
+        try sessions.save(original, account: one)
+        var target = original
+        target.accountUUID = try ClaudeDesktopSessions.uuid(two)
+        let value = target.columns.firstIndex(of: "encrypted_value")!
+        let name = target.columns.firstIndex(of: "name")!
+        let i = target.rows.firstIndex(where: { $0[name] == .text("sessionKey") })!
+        target.rows[i][value] = .blob(Data([0x76, 0x31, 0x30, 0x22, 0x22]))
+        try sessions.save(target, account: two)
+        assert(tryLoad(sessions, two) == target)
+        for snapshot in [target, original, target, original] {
+            try sessions.restore(snapshot)
+            assert(tryCapture(sessions).rows == snapshot.rows)
+            for path in histories { assert((try? Data(contentsOf: sessions.directory.appendingPathComponent(path))) == Data(path.utf8)) }
+        }
+        var empty = original; empty.rows = []
+        try sessions.restore(empty)
+        assert(tryCapture(sessions).rows.isEmpty, "first connection only removes auth cookies")
+        try sessions.restore(original)
+        var invalid = target; invalid.columns[0] = "missing_column"
+        do { try sessions.restore(invalid); fatalError("unknown cookie schema accepted") } catch {}
+        assert(tryCapture(sessions).rows == original.rows, "failed restore rolls back DELETE")
+        var duplicate = target; duplicate.rows.append(duplicate.rows[i])
+        do { try sessions.restore(duplicate); fatalError("invalid cookie insert accepted") } catch {}
+        assert(tryCapture(sessions).rows == original.rows, "failed INSERT rolls back all rows")
+        do { try sessions.save(original, account: two); fatalError("wrong account accepted") } catch {}
+        var plaintext = original; plaintext.rows[i][original.columns.firstIndex(of: "value")!] = .text("secret")
+        do { try sessions.save(plaintext, account: one); fatalError("plaintext credentials exported") } catch {}
+        var expired = original; expired.rows[i][original.columns.firstIndex(of: "expires_utc")!] = .integer(1)
+        do { try sessions.validate(expired, account: one); fatalError("expired session accepted") } catch {}
+        var count: Int32 = 0
+        var statement: OpaquePointer?
+        sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM cookies WHERE value IN ('device','unrelated')", -1, &statement, nil)
+        if sqlite3_step(statement) == SQLITE_ROW { count = sqlite3_column_int(statement, 0) }
+        sqlite3_finalize(statement); sqlite3_close(db)
+        assert(count == 2, "unrelated cookies stay intact")
+        let attrs = try FileManager.default.attributesOfItem(atPath: sessions.sessionDirectory.appendingPathComponent("\(try ClaudeDesktopSessions.uuid(one)).json").path)
+        assert((attrs[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        let finalInode = try FileManager.default.attributesOfItem(atPath: sessions.directory.path)[.systemFileNumber] as? NSNumber
+        assert(finalInode == inode)
+        let log = home.appendingPathComponent("Library/Logs/Claude/main.log")
+        try repository.secureWrite(Data("[account] Account details received via IPC\n".utf8), to: log)
+        let offset = ClaudeDesktopLauncher.logOffset(home: home)
+        assert(!ClaudeDesktopLauncher.authenticated(home: home, since: offset), "old sign-in logs cannot confirm new switch")
+        try repository.secureWrite(Data("[account] Account details received via IPC\n[account] User is logged out, skipping account ID wait\n".utf8), to: log)
+        assert(!ClaudeDesktopLauncher.authenticated(home: home, since: 0))
+        try repository.secureWrite(Data("[account] Login-state transition (loggedOut: true → false, uuid: <none> → target)\n".utf8), to: log)
+        assert(ClaudeDesktopLauncher.authenticated(home: home, since: 0))
+    }
+    static func tryLoad(_ sessions: ClaudeDesktopSessions, _ account: SavedAccount) -> ClaudeDesktopSession? { try! sessions.load(account) }
+    static func tryCapture(_ sessions: ClaudeDesktopSessions) -> ClaudeDesktopSession { try! sessions.capture() }
+
     static func main() async throws {
+        try desktopSessionTests()
         try claudeKeychainTests()
         if CommandLine.arguments.contains("--keychain-integration") { try claudeKeychainIntegrationTest() }
         assert(KeychainVault.errorMessage(errSecAuthFailed, signatureStatus: errSecCSStaticCodeChanged).contains("Quit and reopen"))
@@ -115,8 +185,8 @@ final class UsageURLProtocol: URLProtocol {
         assert(restoredFallback == refreshedClaude, "failed switch restores fallback credentials")
         try FileManager.default.removeItem(at: root.appendingPathComponent(".claude.json"))
         try repository.secureWrite(repository.encode(after), to: root.appendingPathComponent(".claude.json"))
-        // Exercise the same model action used by mini. Local Desktop state must
-        // stay intact across Code switches, reactivation, and failed switches.
+        // CLI credential writes must not alter shared Desktop history. Desktop
+        // cookie switching is exercised independently in desktopSessionTests().
         let desktop = root.appendingPathComponent("Library/Application Support/Claude")
         let legacyProfiles = repository.root.appendingPathComponent("claude-desktop")
         let desktopFiles = [
@@ -129,22 +199,17 @@ final class UsageURLProtocol: URLProtocol {
         ]
         for (url, data) in desktopFiles { try repository.secureWrite(data, to: url) }
         let desktopInode = try FileManager.default.attributesOfItem(atPath: desktop.path)[.systemFileNumber] as? NSNumber
-        try await MainActor.run {
-            let model = AccountsModel(repository: repository)
+        do {
             for target in [claudeOne, claudeTwo, claudeTwo, claudeOne] {
-                model.activate(target, refreshUsage: false)
-                assert(model.active[.claude] == target.id, "Code switch finishes without a Desktop restart")
+                try repository.activate(target, accounts: &accounts)
                 assert(tryIdentity(repository, .claude) == target.identity)
-                assert(model.message.contains("Claude Code switched"))
                 for (url, data) in desktopFiles {
                     let actual = try Data(contentsOf: url)
                     assert(actual == data, "Code switch preserves Desktop history, login, and recovery copies")
                 }
             }
             let mismatch = SavedAccount(id: claudeTwo.id, provider: .claude, identity: "wrong", name: "wrong")
-            model.activate(mismatch, refreshUsage: false)
-            assert(model.active[.claude] == claudeOne.id)
-            assert(model.message.contains("identity mismatch"))
+            do { try repository.activate(mismatch, accounts: &accounts); fatalError("identity mismatch accepted") } catch {}
             for (url, data) in desktopFiles {
                 let actual = try Data(contentsOf: url)
                 assert(actual == data, "failed Code switch preserves Desktop data")

@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import Security
 import CryptoKit
+import SQLite3
 
 // Credentials never enter UserDefaults or the account metadata file.
 protocol CredentialVault {
@@ -202,6 +203,195 @@ enum CodexDesktopLauncher {
         guard process.terminationStatus == 0 else {
             throw AccountError.message("macOS could not reopen Codex Desktop (open exited \(process.terminationStatus)).")
         }
+    }
+}
+
+// Desktop authentication is independent of Claude Code OAuth. Keep the Electron
+// profile in place and swap only Claude's authentication/organization cookies.
+// Cookie ciphertext stays tied to Claude's existing Safe Storage key.
+struct ClaudeDesktopSession: Codable, Equatable {
+    enum Value: Codable, Equatable { case integer(Int64), text(String), blob(Data), null }
+    var accountUUID: String
+    var columns: [String]
+    var rows: [[Value]]
+}
+final class ClaudeDesktopSessions {
+    let repository: AccountRepository
+    var directory: URL { repository.home.appendingPathComponent("Library/Application Support/Claude") }
+    var sessionDirectory: URL { repository.root.appendingPathComponent("claude-desktop/sessions") }
+    static let predicate = "host_key IN ('claude.ai', '.claude.ai') AND name IN ('sessionKey', 'sessionKeyV2', 'sessionKeyV3', 'sessionKeyLC', 'sessionKeyV3LC', 'lastActiveOrg', 'authLastActiveOrg')"
+    init(repository: AccountRepository) { self.repository = repository }
+    func accountUUID() -> String? {
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent("config.json")),
+              let json = try? repository.object(data) else { return nil }
+        return json["lastKnownAccountUuid"] as? String
+    }
+    static func uuid(_ account: SavedAccount) throws -> String {
+        guard account.provider == .claude, let first = account.identity.split(separator: ":").first,
+              let uuid = UUID(uuidString: String(first)) else { throw AccountError.message("Invalid Claude Desktop account identity.") }
+        return uuid.uuidString.lowercased()
+    }
+    private func database<T>(write: Bool = false, _ body: (OpaquePointer) throws -> T) throws -> T {
+        var db: OpaquePointer?
+        let result = sqlite3_open_v2(directory.appendingPathComponent("Cookies").path, &db,
+                                    write ? SQLITE_OPEN_READWRITE : SQLITE_OPEN_READONLY, nil)
+        defer { if let db { sqlite3_close(db) } }
+        guard result == SQLITE_OK, let db else { throw AccountError.message("Cannot open Claude Desktop cookies. Open Claude Desktop once, then retry.") }
+        sqlite3_busy_timeout(db, 3000)
+        return try body(db)
+    }
+    private func execute(_ sql: String, _ db: OpaquePointer) throws {
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+            throw AccountError.message("Cannot update Claude Desktop cookies. The transaction was rolled back; close Desktop and retry.")
+        }
+    }
+    func capture() throws -> ClaudeDesktopSession {
+        try database { db in
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT * FROM cookies WHERE \(Self.predicate)", -1, &statement, nil) == SQLITE_OK, let statement else {
+                throw AccountError.message("Unsupported Claude Desktop cookie database.")
+            }
+            defer { sqlite3_finalize(statement) }
+            let count = sqlite3_column_count(statement)
+            let columns = (0..<count).map { String(cString: sqlite3_column_name(statement, $0)) }
+            var rows: [[ClaudeDesktopSession.Value]] = []
+            var status = sqlite3_step(statement)
+            while status == SQLITE_ROW {
+                let row: [ClaudeDesktopSession.Value] = (0..<count).map { index in
+                    switch sqlite3_column_type(statement, index) {
+                    case SQLITE_INTEGER: return .integer(sqlite3_column_int64(statement, index))
+                    case SQLITE_TEXT: return .text(String(cString: sqlite3_column_text(statement, index)))
+                    case SQLITE_BLOB:
+                        let count = Int(sqlite3_column_bytes(statement, index))
+                        return .blob(count == 0 ? Data() : Data(bytes: sqlite3_column_blob(statement, index)!, count: count))
+                    default: return .null
+                    }
+                }
+                rows.append(row)
+                status = sqlite3_step(statement)
+            }
+            guard status == SQLITE_DONE else { throw AccountError.message("Cannot read Claude Desktop cookies.") }
+            return ClaudeDesktopSession(accountUUID: accountUUID()?.lowercased() ?? "", columns: columns, rows: rows)
+        }
+    }
+    func validate(_ session: ClaudeDesktopSession, account: SavedAccount) throws {
+        guard session.accountUUID == (try Self.uuid(account)) else { throw AccountError.message("Claude Desktop session identity mismatch.") }
+        guard let name = session.columns.firstIndex(of: "name"), let encrypted = session.columns.firstIndex(of: "encrypted_value"),
+              let value = session.columns.firstIndex(of: "value"), let expiry = session.columns.firstIndex(of: "expires_utc"),
+              let host = session.columns.firstIndex(of: "host_key"),
+              Set(session.columns).count == session.columns.count,
+              session.rows.allSatisfy({ $0.count == session.columns.count }) else { throw AccountError.message("Invalid Claude Desktop session format.") }
+        var authenticated = false
+        let now = Int64((Date().timeIntervalSince1970 + 11644473600) * 1_000_000)
+        for row in session.rows {
+            guard case .text(let cookieName) = row[name], case .text(let domain) = row[host],
+                  ["claude.ai", ".claude.ai"].contains(domain),
+                  ["sessionKey", "sessionKeyV2", "sessionKeyV3", "sessionKeyLC", "sessionKeyV3LC", "lastActiveOrg", "authLastActiveOrg"].contains(cookieName) else {
+                throw AccountError.message("Invalid Claude Desktop cookie scope.")
+            }
+            if cookieName.hasPrefix("sessionKey") {
+                guard case .text("") = row[value], case .blob(let data) = row[encrypted], !data.isEmpty else {
+                    throw AccountError.message("Claude Desktop session cookies must be encrypted by Desktop.")
+                }
+                if ["sessionKey", "sessionKeyV2", "sessionKeyV3"].contains(cookieName), case .integer(let time) = row[expiry], time > now { authenticated = true }
+            }
+        }
+        guard authenticated else { throw AccountError.message("Claude Desktop login has expired. Connect this account again.") }
+    }
+    func save(_ session: ClaudeDesktopSession, account: SavedAccount) throws {
+        try validate(session, account: account)
+        try repository.secureWrite(JSONEncoder().encode(session), to: sessionDirectory.appendingPathComponent("\(try Self.uuid(account)).json"))
+    }
+    func load(_ account: SavedAccount) throws -> ClaudeDesktopSession? {
+        let path = sessionDirectory.appendingPathComponent("\(try Self.uuid(account)).json")
+        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
+        let session = try JSONDecoder().decode(ClaudeDesktopSession.self, from: Data(contentsOf: path))
+        try validate(session, account: account)
+        return session
+    }
+    // Call only after Desktop exits. A SQLite transaction retains every unrelated
+    // cookie and rolls back on schema changes or failed inserts; no DB replacement.
+    func restore(_ session: ClaudeDesktopSession) throws {
+        guard Set(session.columns).count == session.columns.count,
+              session.columns.allSatisfy({ $0.range(of: "^[a-z_]+$", options: .regularExpression) != nil }),
+              session.rows.allSatisfy({ $0.count == session.columns.count }) else { throw AccountError.message("Invalid Desktop cookie columns.") }
+        try database(write: true) { db in
+            try execute("BEGIN IMMEDIATE", db)
+            do {
+                try execute("DELETE FROM cookies WHERE \(Self.predicate)", db)
+                if !session.rows.isEmpty {
+                    let names = session.columns.map { "\"\($0)\"" }.joined(separator: ",")
+                    let slots = Array(repeating: "?", count: session.columns.count).joined(separator: ",")
+                    var statement: OpaquePointer?
+                    guard sqlite3_prepare_v2(db, "INSERT INTO cookies (\(names)) VALUES (\(slots))", -1, &statement, nil) == SQLITE_OK, let statement else {
+                        throw AccountError.message("Claude Desktop cookie schema changed. Reconnect this account.")
+                    }
+                    defer { sqlite3_finalize(statement) }
+                    let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+                    for row in session.rows {
+                        sqlite3_reset(statement); sqlite3_clear_bindings(statement)
+                        for (offset, value) in row.enumerated() {
+                            let index = Int32(offset + 1)
+                            let status: Int32
+                            switch value {
+                            case .integer(let number): status = sqlite3_bind_int64(statement, index, number)
+                            case .text(let text): status = sqlite3_bind_text(statement, index, text, -1, transient)
+                            case .blob(let data):
+                                status = data.isEmpty ? sqlite3_bind_zeroblob(statement, index, 0) : data.withUnsafeBytes { sqlite3_bind_blob(statement, index, $0.baseAddress, Int32($0.count), transient) }
+                            case .null: status = sqlite3_bind_null(statement, index)
+                            }
+                            guard status == SQLITE_OK else { throw AccountError.message("Cannot bind Desktop cookie data.") }
+                        }
+                        guard sqlite3_step(statement) == SQLITE_DONE else { throw AccountError.message("Cannot restore Desktop login. Cookie changes were rolled back.") }
+                    }
+                }
+                try execute("COMMIT", db)
+            } catch { try? execute("ROLLBACK", db); throw error }
+        }
+    }
+}
+
+enum ClaudeDesktopLauncher {
+    static let bundle = "com.anthropic.claudefordesktop"
+    static func stop() async throws {
+        let applications = NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == bundle }
+        for application in applications where !application.isTerminated {
+            guard application.terminate() else { throw AccountError.message("Could not close Claude Desktop. Finish its current task and retry.") }
+        }
+        for _ in 0..<200 {
+            if applications.allSatisfy(\.isTerminated) { return }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        throw AccountError.message("Claude Desktop is still running. Finish its current task and retry.")
+    }
+    static func launch(_ app: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = [app.path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run(); process.waitUntilExit()
+        guard process.terminationStatus == 0 else { throw AccountError.message("Could not reopen Claude Desktop.") }
+    }
+    static func logOffset(home: URL) -> UInt64 {
+        let path = home.appendingPathComponent("Library/Logs/Claude/main.log")
+        return (try? FileManager.default.attributesOfItem(atPath: path.path)[.size] as? NSNumber)?.uint64Value ?? 0
+    }
+    // Use fresh authentication events, not lastKnownAccountUuid alone: the latter
+    // remains on disk even after a cookie expires or Desktop shows Sign in.
+    static func authenticated(home: URL, since offset: UInt64) -> Bool {
+        guard let file = try? FileHandle(forReadingFrom: home.appendingPathComponent("Library/Logs/Claude/main.log")) else { return false }
+        defer { try? file.close() }
+        let size = (try? file.seekToEnd()) ?? 0
+        try? file.seek(toOffset: size < offset ? 0 : offset)
+        let data = (try? file.read(upToCount: 1_048_576)) ?? Data()
+        let text = String(decoding: data, as: UTF8.self)
+        var signedIn = false
+        for line in text.split(separator: "\n") {
+            if line.contains("[account] Account details received via IPC") || line.contains("[account] Login-state transition (loggedOut: true → false") { signedIn = true }
+            if line.contains("[account] User is logged out") || line.contains("[account] User logged out during IPC") || line.contains("[account] Login-state transition (loggedOut: false → true") { signedIn = false }
+        }
+        return signedIn
     }
 }
 
@@ -485,6 +675,10 @@ final class AccountRepository {
     @Published var loadingUsage: Set<String> = []
     @Published var signingIn: AccountProvider?
     @Published var switchingCodex = false
+    @Published var switchingClaude = false
+    @Published var waitingForDesktopLogin = false
+    @Published var desktopActive: String?
+    private var desktopSwitchTask: Task<Void, Never>?
     let repository: AccountRepository
     private var loginTask: Task<Void, Never>?
     private var nextAutomaticUsageRequest: [String: Date] = [:]
@@ -554,7 +748,7 @@ final class AccountRepository {
     func activate(_ account: SavedAccount, refreshUsage: Bool = true) {
         do {
             if account.provider == .codex {
-                guard !switchingCodex else { return }
+                guard !switchingCodex, !switchingClaude else { return }
                 guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex") else {
                     throw AccountError.message("Codex Desktop is not installed.")
                 }
@@ -587,15 +781,112 @@ final class AccountRepository {
                     }
                 }
             } else {
-                // Desktop has separate authentication and stores local history in its
-                // application support directory. Code switching must never move it.
-                try repository.activate(account, accounts: &accounts)
-                active[.claude] = account.id
-                message = "Claude Code switched to \(account.name). Claude Desktop uses its own login."
-                if refreshUsage { refresh() }
+                try activateClaudeDesktop(account, refreshUsage: refreshUsage)
             }
         } catch { message = error.localizedDescription }
     }
+    func cancelDesktopSwitch() { desktopSwitchTask?.cancel() }
+    private func activateClaudeDesktop(_ account: SavedAccount, refreshUsage: Bool, forceLogin: Bool = false) throws {
+        guard !switchingClaude, !switchingCodex else { return }
+        guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: ClaudeDesktopLauncher.bundle) else {
+            throw AccountError.message("Claude Desktop is not installed.")
+        }
+        let identity = try repository.identity(repository.secret(account), provider: .claude).0
+        guard identity == account.identity else { throw AccountError.message("Saved account identity mismatch.") }
+        let sessions = ClaudeDesktopSessions(repository: repository)
+        let targetUUID = try ClaudeDesktopSessions.uuid(account)
+        // Resolve the target before stopping or changing anything.
+        let stored = forceLogin ? nil : try sessions.load(account)
+        switchingClaude = true
+        message = "Switching Claude Desktop to \(account.name)…"
+        desktopSwitchTask = Task {
+            defer { switchingClaude = false; desktopSwitchTask = nil; waitingForDesktopLogin = false }
+            var original: ClaudeDesktopSession?
+            var stopped = false
+            var changed = false
+            var stopRequested = false
+            do {
+                stopRequested = true
+                try await ClaudeDesktopLauncher.stop()
+                stopped = true
+                try Task.checkCancellation()
+                let current = try sessions.capture()
+                original = current
+                if let outgoing = accounts.first(where: { $0.provider == .claude && (try? ClaudeDesktopSessions.uuid($0)) == current.accountUUID }) {
+                    // Preserve rotated cookies. Expired sessions must not replace a
+                    // usable saved login, but remain available for rollback below.
+                    if (try? sessions.validate(current, account: outgoing)) != nil { try sessions.save(current, account: outgoing) }
+                }
+                // A durable rollback copy also survives mini being closed mid-login.
+                // Never export plaintext session secrets to Application Support.
+                if let index = current.columns.firstIndex(of: "value"), let name = current.columns.firstIndex(of: "name") {
+                    for row in current.rows {
+                        if case .text(let key) = row[name], key.hasPrefix("sessionKey"), row[index] != .text("") {
+                            throw AccountError.message("Desktop session cookies are not encrypted. Switching was canceled.")
+                        }
+                    }
+                }
+                try repository.secureWrite(JSONEncoder().encode(current), to: sessions.sessionDirectory.appendingPathComponent("before-switch.json"))
+                let currentMatches = !forceLogin && current.accountUUID == targetUUID && (try? sessions.validate(current, account: account)) != nil
+                let target = currentMatches ? current : stored
+                waitingForDesktopLogin = target == nil
+                var replacement = target ?? current
+                if target == nil { replacement.rows = [] }
+                try sessions.restore(replacement)
+                changed = true
+                let offset = ClaudeDesktopLauncher.logOffset(home: repository.home)
+                try ClaudeDesktopLauncher.launch(app)
+                stopped = false
+                if target == nil {
+                    message = "First connection: sign in to Claude Desktop as \(account.name). ccs will save this Desktop login for future switches. History stays in place."
+                } else { message = "Checking Claude Desktop sign-in for \(account.name)…" }
+                var verified = false
+                for _ in 0..<(target == nil ? 600 : 60) {
+                    try await Task.sleep(for: .seconds(1))
+                    if ClaudeDesktopLauncher.authenticated(home: repository.home, since: offset), let uuid = sessions.accountUUID()?.lowercased() {
+                        guard uuid == targetUUID else { throw AccountError.message("Claude Desktop signed in to another account. Restored the previous login; select \(account.name) when connecting.") }
+                        verified = true
+                        break
+                    }
+                }
+                guard verified else { throw AccountError.message("Could not verify Claude Desktop sign-in. Restored the previous login. If the saved session expired, use Reconnect Desktop.") }
+                // Quit once more to flush any cookies rotated during authentication.
+                try await ClaudeDesktopLauncher.stop()
+                stopped = true
+                let connected = try sessions.capture()
+                try sessions.save(connected, account: account)
+                try ClaudeDesktopLauncher.launch(app)
+                stopped = false
+                try repository.activate(account, accounts: &accounts)
+                active[.claude] = account.id
+                desktopActive = account.id
+                message = "Claude Code and Desktop switched to \(account.name)."
+                if refreshUsage { refresh() }
+            } catch {
+                let failure = error is CancellationError ? "Claude Desktop switch canceled." : error.localizedDescription
+                // Cancellation must not cancel cleanup's stop/wait operation.
+                let recovery = Task { @MainActor in
+                    do {
+                        if changed, let original {
+                            try await ClaudeDesktopLauncher.stop()
+                            try sessions.restore(original)
+                        }
+                        if stopRequested && !changed && !stopped { try await ClaudeDesktopLauncher.stop() }
+                        if stopRequested || stopped || changed { try ClaudeDesktopLauncher.launch(app) }
+                        message = failure
+                    } catch {
+                        message = "\(failure) Recovery could not finish: \(error.localizedDescription) The saved login is retained in claude-desktop/sessions/before-switch.json."
+                    }
+                }
+                await recovery.value
+            }
+        }
+    }
+    func reconnectClaudeDesktop(_ account: SavedAccount) {
+        do { try activateClaudeDesktop(account, refreshUsage: true, forceLogin: true) }
+        catch { message = error.localizedDescription }
+    }
+
     func remove(_ account: SavedAccount) {
         do {
             let remaining = accounts.filter { $0.id != account.id }
@@ -714,7 +1005,7 @@ struct AccountsView: View {
                 if model.refreshing { ProgressView().controlSize(.small) }
                 Button { model.refresh() } label: { Image(systemName: "arrow.clockwise") }.disabled(model.refreshing)
             }
-            Text("Switch Codex CLI and Desktop with shared session history. Claude switches Code only; manage Claude Desktop login in Desktop.")
+            Text("Switch Codex CLI and Desktop with shared session history. Claude switches Code and Desktop without moving local history. Connect each Desktop login once.")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
@@ -723,8 +1014,8 @@ struct AccountsView: View {
                             HStack {
                                 Text(provider.rawValue).font(.system(size: 12, weight: .semibold))
                                 Spacer()
-                                Button("Import current") { model.importCurrent(provider) }
-                                Button("＋ Add account") { model.add(provider) }.disabled(model.signingIn != nil)
+                                Button("Import current") { model.importCurrent(provider) }.disabled(model.switchingClaude || model.switchingCodex)
+                                Button("＋ Add account") { model.add(provider) }.disabled(model.signingIn != nil || model.switchingClaude || model.switchingCodex)
                             }
                             ForEach(model.accounts.filter { $0.provider == provider }) { account in
                                 VStack(alignment: .leading, spacing: 9) {
@@ -732,14 +1023,17 @@ struct AccountsView: View {
                                         Text(account.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
                                         Spacer()
                                         if model.active[provider] == account.id {
-                                            Label(provider == .claude ? "Code active" : "Active", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                                            if provider == .codex {
-                                                Button("Restart Desktop") { model.activate(account) }.disabled(model.switchingCodex)
+                                            Label(provider == .claude ? (model.desktopActive == account.id ? "Code + Desktop active" : "Code active") : "Active", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                                            Group {
+                                                Button(provider == .codex ? "Restart Desktop" : "Switch Desktop") { model.activate(account) }.disabled(model.switchingCodex || model.switchingClaude)
                                             }
                                         } else {
-                                            Button(provider == .claude ? "Switch Code" : "Switch") { model.activate(account) }.disabled(model.switchingCodex)
+                                            Button("Switch") { model.activate(account) }.disabled(model.switchingCodex || model.switchingClaude)
                                         }
-                                        Button { removing = account } label: { Image(systemName: "trash") }.buttonStyle(.plain).foregroundStyle(.secondary)
+                                        if provider == .claude {
+                                            Button("Reconnect Desktop…") { model.reconnectClaudeDesktop(account) }.disabled(model.switchingCodex || model.switchingClaude)
+                                        }
+                                        Button { removing = account } label: { Image(systemName: "trash") }.buttonStyle(.plain).foregroundStyle(.secondary).disabled(model.switchingClaude || model.switchingCodex)
                                     }
                                     if model.loadingUsage.contains(account.id) && model.usage[account.id] == nil {
                                         ProgressView("Loading usage…").controlSize(.small)
@@ -768,6 +1062,7 @@ struct AccountsView: View {
                 }
             }
             if model.signingIn != nil { ProgressView("Waiting for sign-in…").controlSize(.small) }
+            if model.switchingClaude { Button("Cancel Desktop switch") { model.cancelDesktopSwitch() } }
             if !model.message.isEmpty { Text(model.message).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
         }
         .font(.system(size: 11)).padding(22)
