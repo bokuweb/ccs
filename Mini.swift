@@ -104,10 +104,7 @@ private struct MiniAccountRow: View {
 
     private var isActive: Bool { model.active[account.provider] == account.id }
     private var activeLabel: String {
-        if account.provider == .codex { return "CLI active" }
-        let profiles = ClaudeDesktopProfiles(repository: model.repository)
-        guard let accountUUID = profiles.accountUUID(account) else { return "Code active" }
-        return profiles.desktopUUID() == accountUUID ? "Active" : "Code active"
+        account.provider == .codex ? "CLI active" : (model.desktopActive == account.id ? "Code + Desktop active" : "Code active")
     }
     private var usageStatus: String {
         guard let error = model.usage[account.id]?.error else { return "No usage" }
@@ -124,22 +121,28 @@ private struct MiniAccountRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(account.name)
-                HStack(spacing: 5) {
-                    if isActive {
+                if isActive {
+                    HStack(spacing: 5) {
                         Circle().fill(MiniStyle.active).frame(width: 6, height: 6)
                         Text(activeLabel)
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(MiniStyle.active)
+                            .lineLimit(1)
                     }
-                    Button(isActive ? "Restart Desktop" : "Switch") { model.activate(account, refreshUsage: false) }
-                        .font(.system(size: 10, weight: .medium))
-                        .buttonStyle(.plain)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(.white.opacity(0.07), in: Capsule())
-                        .overlay(Capsule().stroke(.white.opacity(0.13), lineWidth: 0.5))
-                        .disabled(model.switchingCodex || model.switchingClaude)
                 }
+                Button(isActive ? (account.provider == .codex ? "Restart Desktop" : "Switch Desktop") : "Switch") { model.activate(account, refreshUsage: false) }
+                    .font(.system(size: 10, weight: .medium))
+                    .buttonStyle(.plain)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(.white.opacity(0.07), in: Capsule())
+                    .overlay(Capsule().stroke(.white.opacity(0.13), lineWidth: 0.5))
+                    .disabled(model.switchingCodex || model.switchingClaude)
+                    .contextMenu {
+                        if account.provider == .claude { Button("Reconnect Desktop…") { model.reconnectClaudeDesktop(account) } }
+                    }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -229,6 +232,7 @@ private struct MiniView: View {
                                 .menuIndicator(.hidden)
                                 .fixedSize()
                                 .help("Add or import \(provider.rawValue) account")
+                                .disabled(accounts.switchingClaude || accounts.switchingCodex)
                             }
                             .frame(height: 18)
                             let saved = accounts.accounts.filter { $0.provider == provider }
@@ -260,6 +264,7 @@ private struct MiniView: View {
                         .lineLimit(2)
                         .help(accounts.message)
                     Spacer(minLength: 0)
+                    if accounts.switchingClaude { Button("Cancel") { accounts.cancelDesktopSwitch() }.font(.system(size: 10)) }
                 }
                 .padding(.horizontal, 12)
                 .frame(height: 38)
@@ -303,6 +308,7 @@ private final class MiniPanel: NSPanel {
         panel = MiniPanel(contentRect: NSRect(x: 0, y: 0, width: MiniView.width, height: MiniView.height(for: accounts)),
                           styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isFloatingPanel = true
+        panel.title = "ccs mini"
         panel.level = .popUpMenu
         panel.hasShadow = true
         panel.isOpaque = false
@@ -313,6 +319,13 @@ private final class MiniPanel: NSPanel {
         modelSubscription = accounts.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { self?.resizePanel() }
         }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard panel != nil else { return true }
+        sender.activate(ignoringOtherApps: true)
+        showPanel()
+        return false
     }
 
     @objc private func toggle() {
@@ -382,19 +395,24 @@ private final class MiniPanel: NSPanel {
     }
 
     private func showPanel() {
-        guard let button = status.button, let buttonWindow = button.window else { return }
+        // Reopening an already visible panel must not install duplicate event monitors.
+        hidePanel()
         // Pick up accounts added or removed by the full ccs app since the last open.
         do { accounts.accounts = try accounts.repository.load() }
         catch { accounts.message = "Cannot load saved accounts: \(error.localizedDescription)" }
         accounts.refresh(forceUsage: true)
         resizePanel()
-        let buttonRect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
-        let screen = buttonWindow.screen ?? NSScreen.main
-        let visible = screen?.visibleFrame ?? buttonRect
-        let width = panel.frame.width
-        let x = min(max(buttonRect.midX - width / 2, visible.minX + 4), visible.maxX - width - 4)
-        let y = buttonRect.minY - panel.frame.height - 4
-        panel.setFrameOrigin(NSPoint(x: x, y: y))
+        if let button = status.button, let buttonWindow = button.window,
+           let screen = buttonWindow.screen {
+            let buttonRect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+            let visible = screen.visibleFrame.insetBy(dx: 4, dy: 4)
+            let x = max(visible.minX, min(buttonRect.midX - panel.frame.width / 2, visible.maxX - panel.frame.width))
+            let y = max(visible.minY, min(buttonRect.minY - panel.frame.height - 4, visible.maxY - panel.frame.height))
+            panel.setFrameOrigin(NSPoint(x: x, y: y))
+        } else {
+            // A menu bar item can be unavailable when the menu bar has no room.
+            panel.center()
+        }
         panel.makeKeyAndOrderFront(nil)
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             DispatchQueue.main.async { self?.hidePanel() }

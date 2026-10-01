@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import SQLite3
 
 final class MemoryVault: CredentialVault {
     var values: [String: Data] = [:]
@@ -24,7 +25,135 @@ final class UsageURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 @main struct AccountsTests {
+    static func desktopCodeHistoryTests() throws {
+        let home = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let repository = AccountRepository(home: home, vault: MemoryVault())
+        let history = ClaudeDesktopCodeHistory(repository: repository)
+        let one = SavedAccount(id: "one", provider: .claude, identity: "11111111-1111-1111-1111-111111111111:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", name: "one")
+        let two = SavedAccount(id: "two", provider: .claude, identity: "22222222-2222-2222-2222-222222222222:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", name: "two")
+        let third = SavedAccount(id: "third", provider: .claude, identity: "33333333-3333-3333-3333-333333333333:cccccccc-cccc-cccc-cccc-cccccccccccc", name: "third")
+        let id = "local_\(UUID().uuidString.lowercased())", cli = UUID().uuidString.lowercased()
+        var record: [String: Any] = ["sessionId": id, "cliSessionId": cli, "cwd": "/project", "createdAt": 1, "lastActivityAt": 2, "title": "original", "permissionMode": "bypassPermissions", "remoteMcpServersConfig": ["token": "private"], "sessionPermissionUpdates": ["allow"], "bridgeSessionIds": ["private"]]
+        let original = try history.folder(one).appendingPathComponent("\(id).json")
+        let shared = try history.folder(two).appendingPathComponent("\(id).json")
+        try repository.secureWrite(repository.encode(record), to: original)
+        let transcript = home.appendingPathComponent(".claude/projects/-project/\(cli).jsonl")
+        let transcriptData = Data("conversation\n".utf8)
+        try repository.secureWrite(transcriptData, to: transcript)
+        let initial = try Data(contentsOf: original)
+        let added = try history.synchronize(to: two, accounts: [one, two])
+        assert(added == 1)
+        var copy = try repository.object(Data(contentsOf: shared))
+        assert(copy["cliSessionId"] as? String == cli && copy["cwd"] as? String == "/project")
+        for key in ["permissionMode", "remoteMcpServersConfig", "sessionPermissionUpdates", "bridgeSessionIds"] { assert(copy[key] == nil) }
+        assert(try! Data(contentsOf: original) == initial)
+        assert(try! Data(contentsOf: transcript) == transcriptData)
+        assert((try! FileManager.default.attributesOfItem(atPath: shared.path)[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        let repeated = try history.synchronize(to: two, accounts: [one, two]); assert(repeated == 0)
+        copy["title"] = "continued on two"; copy["lastActivityAt"] = 3
+        copy["remoteMcpServersConfig"] = ["token": "two-private"]
+        try repository.secureWrite(repository.encode(copy), to: shared)
+        let updated = try history.synchronize(to: one, accounts: [one, two]); assert(updated == 1)
+        let back = try repository.object(Data(contentsOf: original))
+        assert(back["title"] as? String == "continued on two")
+        assert((back["remoteMcpServersConfig"] as? [String: String])?["token"] == "private", "preserve target account's connector configuration")
+        let backups = FileManager.default.enumerator(at: repository.root.appendingPathComponent("claude-desktop/history-backups"), includingPropertiesForKeys: nil)!
+        let backup = backups.compactMap { $0 as? URL }.first { $0.lastPathComponent == "\(id).json" }!
+        assert(try! Data(contentsOf: backup) == initial)
+        // Cloud/SSH records, malformed identities, symlinks and unrelated accounts
+        // must not be used as local history sources.
+        for marker in ["cloudSessionId", "sshConfig", "wslConfig", "movedToCloud"] {
+            let otherID = "local_\(UUID().uuidString.lowercased())"
+            var remote = record; remote["sessionId"] = otherID; remote[marker] = "remote"
+            try repository.secureWrite(repository.encode(remote), to: history.folder(one).appendingPathComponent("\(otherID).json"))
+        }
+        record["title"] = "unregistered"; record["lastActivityAt"] = 99
+        try repository.secureWrite(repository.encode(record), to: history.folder(third).appendingPathComponent("\(id).json"))
+        try repository.secureWrite(Data("broken".utf8), to: history.folder(one).appendingPathComponent("local_bad.json"))
+        let externalID = "local_\(UUID().uuidString.lowercased())"
+        record["sessionId"] = externalID
+        let external = home.appendingPathComponent("external.json")
+        try repository.secureWrite(repository.encode(record), to: external)
+        try FileManager.default.createSymbolicLink(at: history.folder(one).appendingPathComponent("\(externalID).json"), withDestinationURL: external)
+        let ignored = try history.synchronize(to: two, accounts: [one, two]); assert(ignored == 0)
+        assert(try! FileManager.default.contentsOfDirectory(atPath: history.folder(two).path).count == 1)
+        // Never replace a damaged target record or roll back a newer record.
+        try repository.secureWrite(Data("retain me".utf8), to: shared)
+        let retained = try history.synchronize(to: two, accounts: [one, two]); assert(retained == 0)
+        assert(try! Data(contentsOf: shared) == Data("retain me".utf8))
+    }
+    static func desktopSessionTests() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let repository = AccountRepository(home: home, vault: MemoryVault())
+        let sessions = ClaudeDesktopSessions(repository: repository)
+        let one = SavedAccount(id: "one", provider: .claude, identity: "11111111-1111-1111-1111-111111111111:org", name: "one")
+        let two = SavedAccount(id: "two", provider: .claude, identity: "22222222-2222-2222-2222-222222222222:org", name: "two")
+        try repository.secureWrite(repository.encode(["lastKnownAccountUuid": try ClaudeDesktopSessions.uuid(one)]), to: sessions.directory.appendingPathComponent("config.json"))
+        let histories = ["Local Storage/leveldb/history", "IndexedDB/history", "claude-code-sessions/history", "local-agent-mode-sessions/history"]
+        for path in histories { try repository.secureWrite(Data(path.utf8), to: sessions.directory.appendingPathComponent(path)) }
+        let inode = try FileManager.default.attributesOfItem(atPath: sessions.directory.path)[.systemFileNumber] as? NSNumber
+        var db: OpaquePointer?
+        assert(sqlite3_open(sessions.directory.appendingPathComponent("Cookies").path, &db) == SQLITE_OK)
+        func sql(_ text: String) { assert(sqlite3_exec(db, text, nil, nil, nil) == SQLITE_OK) }
+        sql("CREATE TABLE cookies (host_key TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, encrypted_value BLOB NOT NULL, expires_utc INTEGER NOT NULL, UNIQUE(host_key,name))")
+        sql("INSERT INTO cookies VALUES ('.claude.ai','sessionKey','',x'7631301111',15000000000000000),('.claude.ai','lastActiveOrg','one',x'',15000000000000000),('.claude.ai','anthropic-device-id','device',x'',15000000000000000),('.example.com','sessionKey','unrelated',x'',15000000000000000)")
+        let original = try sessions.capture()
+        try sessions.save(original, account: one)
+        var target = original
+        target.accountUUID = try ClaudeDesktopSessions.uuid(two)
+        let value = target.columns.firstIndex(of: "encrypted_value")!
+        let name = target.columns.firstIndex(of: "name")!
+        let i = target.rows.firstIndex(where: { $0[name] == .text("sessionKey") })!
+        target.rows[i][value] = .blob(Data([0x76, 0x31, 0x30, 0x22, 0x22]))
+        try sessions.save(target, account: two)
+        assert(tryLoad(sessions, two) == target)
+        for snapshot in [target, original, target, original] {
+            try sessions.restore(snapshot)
+            assert(tryCapture(sessions).rows == snapshot.rows)
+            for path in histories { assert((try? Data(contentsOf: sessions.directory.appendingPathComponent(path))) == Data(path.utf8)) }
+        }
+        var empty = original; empty.rows = []
+        try sessions.restore(empty)
+        assert(tryCapture(sessions).rows.isEmpty, "first connection only removes auth cookies")
+        try sessions.restore(original)
+        var invalid = target; invalid.columns[0] = "missing_column"
+        do { try sessions.restore(invalid); fatalError("unknown cookie schema accepted") } catch {}
+        assert(tryCapture(sessions).rows == original.rows, "failed restore rolls back DELETE")
+        var duplicate = target; duplicate.rows.append(duplicate.rows[i])
+        do { try sessions.restore(duplicate); fatalError("invalid cookie insert accepted") } catch {}
+        assert(tryCapture(sessions).rows == original.rows, "failed INSERT rolls back all rows")
+        do { try sessions.save(original, account: two); fatalError("wrong account accepted") } catch {}
+        var plaintext = original; plaintext.rows[i][original.columns.firstIndex(of: "value")!] = .text("secret")
+        do { try sessions.save(plaintext, account: one); fatalError("plaintext credentials exported") } catch {}
+        var expired = original; expired.rows[i][original.columns.firstIndex(of: "expires_utc")!] = .integer(1)
+        do { try sessions.validate(expired, account: one); fatalError("expired session accepted") } catch {}
+        var count: Int32 = 0
+        var statement: OpaquePointer?
+        sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM cookies WHERE value IN ('device','unrelated')", -1, &statement, nil)
+        if sqlite3_step(statement) == SQLITE_ROW { count = sqlite3_column_int(statement, 0) }
+        sqlite3_finalize(statement); sqlite3_close(db)
+        assert(count == 2, "unrelated cookies stay intact")
+        let attrs = try FileManager.default.attributesOfItem(atPath: sessions.sessionDirectory.appendingPathComponent("\(try ClaudeDesktopSessions.uuid(one)).json").path)
+        assert((attrs[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        let finalInode = try FileManager.default.attributesOfItem(atPath: sessions.directory.path)[.systemFileNumber] as? NSNumber
+        assert(finalInode == inode)
+        let log = home.appendingPathComponent("Library/Logs/Claude/main.log")
+        try repository.secureWrite(Data("[account] Account details received via IPC\n".utf8), to: log)
+        let offset = ClaudeDesktopLauncher.logOffset(home: home)
+        assert(!ClaudeDesktopLauncher.authenticated(home: home, since: offset), "old sign-in logs cannot confirm new switch")
+        try repository.secureWrite(Data("[account] Account details received via IPC\n[account] User is logged out, skipping account ID wait\n".utf8), to: log)
+        assert(!ClaudeDesktopLauncher.authenticated(home: home, since: 0))
+        try repository.secureWrite(Data("[account] Login-state transition (loggedOut: true → false, uuid: <none> → target)\n".utf8), to: log)
+        assert(ClaudeDesktopLauncher.authenticated(home: home, since: 0))
+    }
+    static func tryLoad(_ sessions: ClaudeDesktopSessions, _ account: SavedAccount) -> ClaudeDesktopSession? { try! sessions.load(account) }
+    static func tryCapture(_ sessions: ClaudeDesktopSessions) -> ClaudeDesktopSession { try! sessions.capture() }
+
     static func main() async throws {
+        try desktopCodeHistoryTests()
+        try desktopSessionTests()
         try claudeKeychainTests()
         if CommandLine.arguments.contains("--keychain-integration") { try claudeKeychainIntegrationTest() }
         assert(KeychainVault.errorMessage(errSecAuthFailed, signatureStatus: errSecCSStaticCodeChanged).contains("Quit and reopen"))
@@ -114,30 +243,39 @@ final class UsageURLProtocol: URLProtocol {
         let restoredFallback = try Data(contentsOf: root.appendingPathComponent(".claude/.credentials.json"))
         assert(restoredFallback == refreshedClaude, "failed switch restores fallback credentials")
         try FileManager.default.removeItem(at: root.appendingPathComponent(".claude.json"))
-        let desktopOneUUID = UUID().uuidString.lowercased()
-        let desktopTwoUUID = UUID().uuidString.lowercased()
-        let desktopOne = SavedAccount(id: UUID().uuidString, provider: .claude, identity: "\(desktopOneUUID):org", name: "first")
-        let desktopTwo = SavedAccount(id: UUID().uuidString, provider: .claude, identity: "\(desktopTwoUUID):org", name: "second")
-        let desktopProfiles = ClaudeDesktopProfiles(repository: repository)
-        try repository.secureWrite(repository.encode(["lastKnownAccountUuid": desktopOneUUID]), to: desktopProfiles.desktop.appendingPathComponent("config.json"))
-        try repository.secureWrite(Data("first-profile".utf8), to: desktopProfiles.desktop.appendingPathComponent("sentinel"))
-        let needsSignIn = try desktopProfiles.select(desktopTwo, accounts: [desktopOne, desktopTwo])
-        assert(!needsSignIn, "new Desktop login needs sign-in")
-        assert(desktopProfiles.selectedID() == desktopTwo.id)
-        let firstSaved = try String(contentsOf: desktopProfiles.profiles.appendingPathComponent("\(desktopOne.id)/sentinel"), encoding: .utf8)
-        assert(firstSaved == "first-profile")
-        try repository.secureWrite(repository.encode(["lastKnownAccountUuid": desktopTwoUUID]), to: desktopProfiles.desktop.appendingPathComponent("config.json"))
-        try repository.secureWrite(Data("second-profile".utf8), to: desktopProfiles.desktop.appendingPathComponent("sentinel"))
-        let restoredLogin = try desktopProfiles.select(desktopOne, accounts: [desktopOne, desktopTwo])
-        assert(restoredLogin, "saved Desktop login is restored")
-        assert(desktopProfiles.desktopUUID() == desktopOneUUID)
-        let firstRestored = try String(contentsOf: desktopProfiles.desktop.appendingPathComponent("sentinel"), encoding: .utf8)
-        let secondSaved = try String(contentsOf: desktopProfiles.profiles.appendingPathComponent("\(desktopTwo.id)/sentinel"), encoding: .utf8)
-        assert(firstRestored == "first-profile" && secondSaved == "second-profile")
-        let wrongUUID = UUID().uuidString.lowercased()
-        try repository.secureWrite(repository.encode(["lastKnownAccountUuid": wrongUUID]), to: desktopProfiles.profiles.appendingPathComponent("\(desktopTwo.id)/config.json"))
-        do { _ = try desktopProfiles.select(desktopTwo, accounts: [desktopOne, desktopTwo]); fatalError("mismatched Desktop profile accepted") } catch {}
-        assert(desktopProfiles.desktopUUID() == desktopOneUUID, "mismatch leaves current Desktop profile untouched")
+        try repository.secureWrite(repository.encode(after), to: root.appendingPathComponent(".claude.json"))
+        // CLI credential writes must not alter shared Desktop history. Desktop
+        // cookie switching is exercised independently in desktopSessionTests().
+        let desktop = root.appendingPathComponent("Library/Application Support/Claude")
+        let legacyProfiles = repository.root.appendingPathComponent("claude-desktop")
+        let desktopFiles = [
+            desktop.appendingPathComponent("config.json"): try repository.encode(["lastKnownAccountUuid": UUID().uuidString]),
+            desktop.appendingPathComponent("Local Storage/leveldb/history.ldb"): Data("existing chat history".utf8),
+            desktop.appendingPathComponent("LocalAgentModeSessions/session.json"): Data("existing Code session".utf8),
+            desktop.appendingPathComponent("Cookies"): Data("existing Desktop login".utf8),
+            legacyProfiles.appendingPathComponent("profiles/old-account/history"): Data("recoverable history".utf8),
+            legacyProfiles.appendingPathComponent("selected.json"): Data("legacy selection".utf8)
+        ]
+        for (url, data) in desktopFiles { try repository.secureWrite(data, to: url) }
+        let desktopInode = try FileManager.default.attributesOfItem(atPath: desktop.path)[.systemFileNumber] as? NSNumber
+        do {
+            for target in [claudeOne, claudeTwo, claudeTwo, claudeOne] {
+                try repository.activate(target, accounts: &accounts)
+                assert(tryIdentity(repository, .claude) == target.identity)
+                for (url, data) in desktopFiles {
+                    let actual = try Data(contentsOf: url)
+                    assert(actual == data, "Code switch preserves Desktop history, login, and recovery copies")
+                }
+            }
+            let mismatch = SavedAccount(id: claudeTwo.id, provider: .claude, identity: "wrong", name: "wrong")
+            do { try repository.activate(mismatch, accounts: &accounts); fatalError("identity mismatch accepted") } catch {}
+            for (url, data) in desktopFiles {
+                let actual = try Data(contentsOf: url)
+                assert(actual == data, "failed Code switch preserves Desktop data")
+            }
+        }
+        let desktopInodeAfter = try FileManager.default.attributesOfItem(atPath: desktop.path)[.systemFileNumber] as? NSNumber
+        assert(desktopInode == desktopInodeAfter, "Desktop directory is never replaced")
         let usage = AccountRepository.parseUsage(["rate_limit": ["primary_window": ["used_percent": 28, "limit_window_seconds": 18000, "reset_at": 1900000000]]], provider: .codex)
         assert(usage.count == 1 && usage[0].used == 28 && usage[0].label == "5 hours")
         assert(AccountRepository.parseUsage(["rate_limit": ["primary_window": [:]]], provider: .codex).isEmpty, "missing usage is not zero")
@@ -190,7 +328,7 @@ final class UsageURLProtocol: URLProtocol {
         assert(claudeKeychainReads == 0, "usage refresh does not read Claude Code Keychain")
         let fallbackRefresh = try repository.object(Data(contentsOf: root.appendingPathComponent(".claude/.credentials.json")))["claudeAiOauth"] as! [String: Any]
         assert(fallbackRefresh["accessToken"] as? String == "renewed", "matching file credentials receive refreshed token")
-        print("Account tests passed: switching, token preservation, Claude Desktop profiles, usage parsing, Claude OAuth refresh and retry.")
+        print("Account tests passed: switching, token preservation, Claude Desktop history preservation, usage parsing, Claude OAuth refresh and retry.")
     }
     static func tryIdentity(_ repo: AccountRepository, _ provider: AccountProvider) -> String { try! repo.identity(repo.capture(provider)!, provider: provider).0 }
     static func claudeTwoSecret(_ repo: AccountRepository, _ account: SavedAccount) -> Data { try! repo.secret(account).credentials }
