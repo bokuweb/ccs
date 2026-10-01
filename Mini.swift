@@ -4,6 +4,7 @@ import ServiceManagement
 import SwiftUI
 
 private enum MiniStyle {
+    static let accountRowHeight: CGFloat = 88
     static let accent = Color(red: 0.34, green: 0.64, blue: 1.0)
     static let active = Color(red: 0.38, green: 0.84, blue: 0.59)
     static let panelTop = Color(red: 0.17, green: 0.18, blue: 0.20)
@@ -74,10 +75,21 @@ private struct UsageRing: View {
             Text(window.label == "5 hours" ? "5h" : window.label)
                 .font(.system(size: 8))
                 .foregroundStyle(.secondary)
+            if let reset = window.reset {
+                Text(reset, format: .dateTime.month(.twoDigits).day(.twoDigits))
+                    .font(.system(size: 8))
+                    .foregroundStyle(.secondary)
+                Text(reset.formatted(date: .omitted, time: .shortened))
+                    .font(.system(size: 8))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
         }
-        .frame(width: 43)
+        .frame(width: 54)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(window.label), \(Int(window.used.rounded())) percent used")
+        .accessibilityLabel("\(window.label), \(Int(window.used.rounded())) percent used" +
+                            (window.reset.map { ", resets \($0.formatted(date: .abbreviated, time: .shortened))" } ?? ""))
         .help(window.reset.map { "Resets \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "\(window.label) usage")
         .onAppear { withAnimation(.easeOut(duration: 0.7)) { displayedUsage = window.used } }
         .onChange(of: window.used) { _, value in
@@ -156,7 +168,7 @@ private struct MiniAccountRow: View {
             }
         }
         .padding(.horizontal, 9)
-        .frame(height: 59)
+        .frame(height: MiniStyle.accountRowHeight)
         .background {
             RoundedRectangle(cornerRadius: 8)
                 .fill(LinearGradient(colors: [.white.opacity(isActive ? 0.085 : 0.065),
@@ -186,7 +198,7 @@ private struct MiniView: View {
         let rowCount = max(2, accounts.accounts.count)
         let rowGaps = max(0, accounts.accounts.count - 2)
         let messageHeight: CGFloat = accounts.signingIn != nil || !accounts.message.isEmpty ? 38 : 0
-        return min(500, CGFloat(16 + 46 + 10 + rowCount * 59 + rowGaps * 5) + messageHeight)
+        return min(500, CGFloat(16 + 46 + 10 + rowGaps * 5) + CGFloat(rowCount) * MiniStyle.accountRowHeight + messageHeight)
     }
 
     var body: some View {
@@ -225,7 +237,7 @@ private struct MiniView: View {
                                     .font(.system(size: 11))
                                     .foregroundStyle(.secondary)
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                                    .frame(height: 59)
+                                    .frame(height: MiniStyle.accountRowHeight)
                             } else {
                                 VStack(spacing: 5) {
                                     ForEach(saved) { account in

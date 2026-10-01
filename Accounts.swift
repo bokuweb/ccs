@@ -917,7 +917,10 @@ struct AccountsView: View {
                                                 ProgressView(value: window.used, total: 100).tint(window.used >= 90 ? .orange : .accentColor).frame(width: 110)
                                                 Text("\(Int(window.used))% used").monospacedDigit()
                                                 Spacer()
-                                                if let reset = window.reset { Text("Resets \(reset, style: .relative)").foregroundStyle(.secondary) }
+                                                if let reset = window.reset {
+                                                    Text("Resets \(reset.formatted(date: .abbreviated, time: .shortened))")
+                                                        .foregroundStyle(.secondary)
+                                                }
                                             }
                                         }
                                         if let error = usage.error { Text(error).foregroundStyle(.orange) }
