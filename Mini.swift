@@ -141,7 +141,11 @@ private struct MiniAccountRow: View {
                     .overlay(Capsule().stroke(.white.opacity(0.13), lineWidth: 0.5))
                     .disabled(model.switchingCodex || model.switchingClaude)
                     .contextMenu {
-                        if account.provider == .claude { Button("Reconnect Desktop…") { model.reconnectClaudeDesktop(account) } }
+                        if account.provider == .claude {
+                            Button("Reconnect Code…") { model.reconnectCode(account) }
+                                .disabled(model.signingIn != nil || model.switchingClaude || model.switchingCodex)
+                            Button("Reconnect Desktop…") { model.reconnectClaudeDesktop(account) }
+                        }
                     }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -156,6 +160,16 @@ private struct MiniAccountRow: View {
                         .foregroundStyle(.secondary)
                 }
                 .accessibilityLabel("Loading usage for \(account.name)")
+            } else if account.provider == .claude, model.usage[account.id]?.requiresSignIn == true {
+                VStack(alignment: .trailing, spacing: 4) {
+                    Text("Usage sign-in expired")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                    Button("Reconnect Code…") { model.reconnectCode(account) }
+                        .font(.system(size: 10, weight: .medium))
+                        .disabled(model.signingIn != nil || model.switchingClaude || model.switchingCodex)
+                }
+                .fixedSize()
             } else if let usage = model.usage[account.id], !usage.windows.isEmpty {
                 HStack(alignment: .center, spacing: 2) {
                     ForEach(usage.windows) { window in UsageRing(window: window) }

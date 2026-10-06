@@ -140,10 +140,12 @@ struct KeychainVault: CredentialVault {
 enum AccountError: LocalizedError {
     case message(String)
     case rateLimited
+    case signInRequired
     var errorDescription: String? {
         switch self {
         case .message(let message): return message
         case .rateLimited: return "Usage temporarily rate limited (HTTP 429). Try again later."
+        case .signInRequired: return "Sign in again to load usage."
         }
     }
 }
@@ -172,6 +174,7 @@ struct AccountUsage {
     var windows: [UsageWindow] = []
     var updated: Date?
     var error: String?
+    var requiresSignIn = false
 }
 
 enum CodexDesktopLauncher {
@@ -660,25 +663,38 @@ final class AccountRepository {
         if account.provider == .codex {
             try secureWrite(latest.credentials, to: home.appendingPathComponent(".codex/auth.json"))
         } else {
-            let profileURL = home.appendingPathComponent(".claude.json")
-            let oldProfile = try? Data(contentsOf: profileURL)
-            var config = try oldProfile.map(object) ?? [:]
-            config["oauthAccount"] = try latest.profile.map(object)
-            let old = try vault.read(claudeService(directory: nil), user)
-            let fallback = home.appendingPathComponent(".claude/.credentials.json")
-            let oldFallback = FileManager.default.fileExists(atPath: fallback.path) ? try Data(contentsOf: fallback) : nil
-            try vault.write(latest.credentials, claudeService(directory: nil), user)
+            try writeCurrentClaude(latest)
+        }
+    }
+    // A new, explicit login supersedes revoked credentials even if their
+    // recorded expiry is later. Never accept a different browser account.
+    func reconnectClaude(_ account: SavedAccount, secret: AccountSecret) throws {
+        guard account.provider == .claude,
+              try identity(secret, provider: .claude).0 == account.identity else {
+            throw AccountError.message("Signed in to a different account. Reconnect Code again and choose \(account.name).")
+        }
+        try vault.write(JSONEncoder().encode(secret), service, account.id)
+        if currentClaudeIdentity() == account.identity { try writeCurrentClaude(secret) }
+    }
+    private func writeCurrentClaude(_ latest: AccountSecret) throws {
+        let profileURL = home.appendingPathComponent(".claude.json")
+        let oldProfile = try? Data(contentsOf: profileURL)
+        var config = try oldProfile.map(object) ?? [:]
+        config["oauthAccount"] = try latest.profile.map(object)
+        let old = try vault.read(claudeService(directory: nil), user)
+        let fallback = home.appendingPathComponent(".claude/.credentials.json")
+        let oldFallback = FileManager.default.fileExists(atPath: fallback.path) ? try Data(contentsOf: fallback) : nil
+        try vault.write(latest.credentials, claudeService(directory: nil), user)
+        do {
+            if oldFallback != nil { try secureWrite(latest.credentials, to: fallback) }
+            try secureWrite(encode(config), to: profileURL)
+        } catch {
             do {
-                if oldFallback != nil { try secureWrite(latest.credentials, to: fallback) }
-                try secureWrite(encode(config), to: profileURL)
-            } catch {
-                do {
-                    if let old { try vault.write(old, claudeService(directory: nil), user) }
-                    else { try vault.remove(claudeService(directory: nil), user) }
-                    if let oldFallback { try secureWrite(oldFallback, to: fallback) }
-                } catch { throw AccountError.message("Switch failed and rollback failed. Saved accounts are intact; sign in again before continuing.") }
-                throw error
-            }
+                if let old { try vault.write(old, claudeService(directory: nil), user) }
+                else { try vault.remove(claudeService(directory: nil), user) }
+                if let oldFallback { try secureWrite(oldFallback, to: fallback) }
+            } catch { throw AccountError.message("Switch failed and rollback failed. Saved accounts are intact; sign in again before continuing.") }
+            throw error
         }
     }
     func importLegacyDesktopCredentials(_ account: SavedAccount) throws {
@@ -715,10 +731,10 @@ final class AccountRepository {
         var auth = try object(saved.credentials)
         guard var oauth = auth["claudeAiOauth"] as? [String: Any],
               let refresh = oauth["refreshToken"] as? String, !refresh.isEmpty else {
-            throw AccountError.message("Claude sign-in expired. Sign in again to load usage.")
+            throw AccountError.signInRequired
         }
         // Claude Code uses this OAuth client and JSON token exchange for its own refresh.
-        var request = URLRequest(url: URL(string: "https://console.anthropic.com/v1/oauth/token")!)
+        var request = URLRequest(url: URL(string: "https://platform.claude.com/v1/oauth/token")!)
         request.httpMethod = "POST"
         request.timeoutInterval = 15
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -733,9 +749,11 @@ final class AccountRepository {
               let result = try? object(data),
               let access = result["access_token"] as? String, !access.isEmpty,
               let lifetime = (result["expires_in"] as? NSNumber)?.doubleValue, lifetime > 0 else {
-            throw AccountError.message(code == 400 || code == 401 || code == 403
-                ? "Claude sign-in expired. Sign in again to load usage."
-                : "Could not refresh Claude sign-in (HTTP \(code)). Retry later.")
+            if (try? object(data)["error"] as? String) == "invalid_grant" || code == 401 {
+                throw AccountError.signInRequired
+            }
+            if code == 429 { throw AccountError.rateLimited }
+            throw AccountError.message("Could not refresh Claude sign-in (HTTP \(code)). Retry later.")
         }
         oauth["accessToken"] = access
         oauth["refreshToken"] = result["refresh_token"] as? String ?? refresh
@@ -761,7 +779,7 @@ final class AccountRepository {
         let auth = try object(secret(account).credentials)
         let codex = account.provider == .codex
         let tokens = auth[codex ? "tokens" : "claudeAiOauth"] as? [String: Any] ?? [:]
-        guard let access = tokens[codex ? "access_token" : "accessToken"] as? String else { throw AccountError.message("Sign in again to load usage.") }
+        guard let access = tokens[codex ? "access_token" : "accessToken"] as? String, !access.isEmpty else { throw AccountError.signInRequired }
         var request = URLRequest(url: URL(string: codex ? "https://chatgpt.com/backend-api/wham/usage" : "https://api.anthropic.com/api/oauth/usage")!)
         request.timeoutInterval = 15
         request.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
@@ -782,7 +800,8 @@ final class AccountRepository {
             code = (response as? HTTPURLResponse)?.statusCode ?? 0
         }
         if code == 429 { throw AccountError.rateLimited }
-        guard code == 200 else { throw AccountError.message(code == 401 || code == 403 ? "Sign in again to refresh usage." : "Usage unavailable (HTTP \(code)). Retry later.") }
+        if code == 401 { throw AccountError.signInRequired }
+        guard code == 200 else { throw AccountError.message("Usage unavailable (HTTP \(code)). Retry later.") }
         let windows = Self.parseUsage(try object(data), provider: account.provider)
         guard !windows.isEmpty else { throw AccountError.message("Usage limits are not available for this account.") }
         return AccountUsage(windows: windows, updated: Date())
@@ -803,11 +822,14 @@ final class AccountRepository {
     @Published var desktopActive: String?
     private var desktopSwitchTask: Task<Void, Never>?
     let repository: AccountRepository
+    private let usageSession: URLSession
     private var loginTask: Task<Void, Never>?
     private var nextAutomaticUsageRequest: [String: Date] = [:]
     private var rateLimitedUntil: [String: Date] = [:]
-    init(repository: AccountRepository = AccountRepository()) {
+    private var pendingForcedUsageRefresh = false
+    init(repository: AccountRepository = AccountRepository(), usageSession: URLSession = .shared) {
         self.repository = repository
+        self.usageSession = usageSession
         do { accounts = try repository.load() } catch { message = "Cannot load saved accounts: \(error.localizedDescription)" }
     }
     func syncActive() throws {
@@ -833,7 +855,7 @@ final class AccountRepository {
             let account = try repository.store(secret, provider: provider, accounts: &accounts)
             active[provider] = account.id
             message = "Imported \(account.name)."
-            if refreshUsage { refresh() }
+            if refreshUsage { refresh(forceUsage: true) }
         } catch { message = error.localizedDescription }
     }
     private func signInCurrentClaude() {
@@ -1013,13 +1035,20 @@ final class AccountRepository {
         } catch { message = error.localizedDescription }
     }
     func refresh(forceUsage: Bool = false) {
-        guard !refreshing else { return }
+        guard !refreshing else {
+            pendingForcedUsageRefresh = pendingForcedUsageRefresh || forceUsage
+            return
+        }
         refreshing = true
         loadingUsage = Set(accounts.map(\.id))
         Task {
             defer {
                 loadingUsage.removeAll()
                 refreshing = false
+                if pendingForcedUsageRefresh {
+                    pendingForcedUsageRefresh = false
+                    refresh(forceUsage: true)
+                }
             }
             // A missing login for one provider must not hide the other provider's usage.
             for provider in AccountProvider.allCases where accounts.contains(where: { $0.provider == provider }) {
@@ -1052,7 +1081,7 @@ final class AccountRepository {
                     nextAutomaticUsageRequest[account.id] = now.addingTimeInterval(10 * 60)
                 }
                 do {
-                    usage[account.id] = try await repository.usage(account)
+                    usage[account.id] = try await repository.usage(account, session: usageSession)
                     rateLimitedUntil[account.id] = nil
                 }
                 catch {
@@ -1060,13 +1089,21 @@ final class AccountRepository {
                         rateLimitedUntil[account.id] = Date().addingTimeInterval(15 * 60)
                     }
                     var old = usage[account.id] ?? AccountUsage()
+                    old.requiresSignIn = false
+                    if let accountError = error as? AccountError, case .signInRequired = accountError {
+                        old.requiresSignIn = true
+                    }
                     old.error = error.localizedDescription; usage[account.id] = old
                 }
                 loadingUsage.remove(account.id)
             }
         }
     }
-    func add(_ provider: AccountProvider) {
+    func reconnectCode(_ account: SavedAccount) {
+        guard account.provider == .claude, !switchingClaude, !switchingCodex else { return }
+        add(.claude, reconnecting: account)
+    }
+    func add(_ provider: AccountProvider, reconnecting: SavedAccount? = nil) {
         guard signingIn == nil else { return }
         do {
             let directory = repository.root.appendingPathComponent("login-\(UUID().uuidString)")
@@ -1081,6 +1118,7 @@ final class AccountRepository {
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
             guard NSWorkspace.shared.open(script) else { throw AccountError.message("Could not open Terminal for sign-in.") }
             signingIn = provider; message = "Complete \(provider.rawValue) sign-in in Terminal and your browser. Your current account stays active."
+            if let account = reconnecting { message = "Sign in to Claude Code as \(account.name) in your browser to restore usage." }
             loginTask = Task {
                 defer {
                     try? repository.vault.remove(repository.claudeService(directory: directory), repository.user)
@@ -1095,9 +1133,18 @@ final class AccountRepository {
                     if FileManager.default.fileExists(atPath: directory.appendingPathComponent("complete").path) {
                         do {
                             guard let secret = try repository.capture(provider, directory: directory) else { throw AccountError.message("Sign-in finished without credentials.") }
-                            let account = try repository.store(secret, provider: provider, accounts: &accounts)
-                            message = "Added \(account.name). Click Switch to use it."
-                            refresh()
+                            // Let any request using the old token finish before
+                            // replacing it, then bypass the usage polling delay.
+                            while refreshing || switchingClaude || switchingCodex { try await Task.sleep(for: .milliseconds(100)) }
+                            if let account = reconnecting {
+                                guard accounts.contains(where: { $0.id == account.id }) else { return }
+                                try repository.reconnectClaude(account, secret: secret)
+                                message = "Reconnected Code for \(account.name). Refreshing usage."
+                            } else {
+                                let account = try repository.store(secret, provider: provider, accounts: &accounts)
+                                message = "Added \(account.name). Click Switch to use it."
+                            }
+                            refresh(forceUsage: true)
                         } catch { message = error.localizedDescription }
                         return
                     }
@@ -1166,6 +1213,10 @@ struct AccountsView: View {
                                             }
                                         }
                                         if let error = usage.error { Text(error).foregroundStyle(.orange) }
+                                        if provider == .claude && usage.requiresSignIn {
+                                            Button("Reconnect Code…") { model.reconnectCode(account) }
+                                                .disabled(model.signingIn != nil || model.switchingClaude || model.switchingCodex)
+                                        }
                                         if let updated = usage.updated { Text("Updated \(updated, style: .relative) ago\(usage.error == nil ? "" : " · Stale")").foregroundStyle(.secondary) }
                                     } else { Text("Usage not loaded").foregroundStyle(.secondary) }
                                 }
