@@ -379,19 +379,59 @@ enum ClaudeDesktopLauncher {
     }
     // Use fresh authentication events, not lastKnownAccountUuid alone: the latter
     // remains on disk even after a cookie expires or Desktop shows Sign in.
-    static func authenticated(home: URL, since offset: UInt64) -> Bool {
-        guard let file = try? FileHandle(forReadingFrom: home.appendingPathComponent("Library/Logs/Claude/main.log")) else { return false }
+    struct Authentication {
+        var signedIn = false
+        var accountUUID: String?
+
+        func matches(_ targetUUID: String, persistedUUID: String?) -> Bool {
+            signedIn && persistedUUID?.lowercased() == targetUUID &&
+                (accountUUID == nil || accountUUID == targetUUID)
+        }
+    }
+    static func authentication(home: URL, since offset: UInt64) -> Authentication {
+        guard let file = try? FileHandle(forReadingFrom: home.appendingPathComponent("Library/Logs/Claude/main.log")) else { return Authentication() }
         defer { try? file.close() }
         let size = (try? file.seekToEnd()) ?? 0
         try? file.seek(toOffset: size < offset ? 0 : offset)
         let data = (try? file.read(upToCount: 1_048_576)) ?? Data()
         let text = String(decoding: data, as: UTF8.self)
-        var signedIn = false
+        var result = Authentication()
         for line in text.split(separator: "\n") {
-            if line.contains("[account] Account details received via IPC") || line.contains("[account] Login-state transition (loggedOut: true → false") { signedIn = true }
-            if line.contains("[account] User is logged out") || line.contains("[account] User logged out during IPC") || line.contains("[account] Login-state transition (loggedOut: false → true") { signedIn = false }
+            if line.contains("[account] Account details received via IPC") || line.contains("claude.ai account active and logged in") { result.signedIn = true }
+            if let transition = line.range(of: "[account] Login-state transition (loggedOut: "),
+               let separator = line.range(of: ", uuid: ", range: transition.upperBound..<line.endIndex),
+               let end = line[separator.upperBound...].firstIndex(of: ")") {
+                let login = line[transition.upperBound..<separator.lowerBound].components(separatedBy: " → ").last
+                result.signedIn = login == "false"
+                let uuid = line[separator.upperBound..<end].components(separatedBy: " → ").last ?? ""
+                result.accountUUID = UUID(uuidString: uuid)?.uuidString.lowercased()
+            }
+            if line.contains("[account] User is logged out") || line.contains("[account] User logged out during IPC") { result = Authentication() }
         }
-        return signedIn
+        return result
+    }
+    static func authenticated(home: URL, since offset: UInt64) -> Bool {
+        authentication(home: home, since: offset).signedIn
+    }
+    static func waitForAccount(_ targetUUID: String, sessions: ClaudeDesktopSessions, since offset: UInt64,
+                               attempts: Int = 60,
+                               pause: () async throws -> Void = { try await Task.sleep(for: .seconds(1)) }) async throws {
+        var matches = 0
+        for _ in 0..<attempts {
+            try Task.checkCancellation()
+            try await pause()
+            let state = authentication(home: sessions.repository.home, since: offset)
+            // Desktop emits its login event before persisting lastKnownAccountUuid.
+            // An outgoing UUID during startup is pending, not a failed switch.
+            matches = state.matches(targetUUID, persistedUUID: sessions.accountUUID()) ? matches + 1 : 0
+            if matches >= 2 { return }
+        }
+        throw AccountError.message("Could not verify the selected Claude Desktop account. Restored the previous login. Retry, or use Reconnect Desktop if the saved session expired.")
+    }
+    static func launchAndVerify(_ app: URL, targetUUID: String, sessions: ClaudeDesktopSessions, attempts: Int = 60) async throws {
+        let offset = logOffset(home: sessions.repository.home)
+        try launch(app)
+        try await waitForAccount(targetUUID, sessions: sessions, since: offset, attempts: attempts)
     }
 }
 
@@ -595,7 +635,14 @@ final class AccountRepository {
         let target = try secret(account)
         guard try identity(target, provider: account.provider).0 == account.identity else { throw AccountError.message("Account identity mismatch. Sign in again.") }
         // Save the outgoing account, including rotated tokens, before replacing anything.
-        if let current = try capture(account.provider) {
+        // A signed-out Claude CLI can retain its profile and an empty OAuth
+        // entry. Do not let that prevent restoring a valid saved login, or
+        // overwrite the outgoing account's usable saved credentials with it.
+        let current = try capture(account.provider)
+        let currentClaudeToken = try current.flatMap {
+            (try object($0.credentials)["claudeAiOauth"] as? [String: Any])?["accessToken"] as? String
+        } ?? ""
+        if let current, account.provider != .claude || !currentClaudeToken.isEmpty {
             let sameAccount = try identity(current, provider: account.provider).0 == account.identity
             if account.provider != .codex || !sameAccount {
                 try store(current, provider: account.provider, accounts: &accounts)
@@ -910,29 +957,19 @@ final class AccountRepository {
                 if target == nil { replacement.rows = [] }
                 try sessions.restore(replacement)
                 changed = true
-                let offset = ClaudeDesktopLauncher.logOffset(home: repository.home)
-                try ClaudeDesktopLauncher.launch(app)
-                stopped = false
                 if target == nil {
                     message = "First connection: sign in to Claude Desktop as \(account.name). ccs will save this Desktop login for future switches. History stays in place."
                 } else { message = "Checking Claude Desktop sign-in for \(account.name)…" }
-                var verified = false
-                for _ in 0..<(target == nil ? 600 : 60) {
-                    try await Task.sleep(for: .seconds(1))
-                    if ClaudeDesktopLauncher.authenticated(home: repository.home, since: offset), let uuid = sessions.accountUUID()?.lowercased() {
-                        guard uuid == targetUUID else { throw AccountError.message("Claude Desktop signed in to another account. Restored the previous login; select \(account.name) when connecting.") }
-                        verified = true
-                        break
-                    }
-                }
-                guard verified else { throw AccountError.message("Could not verify Claude Desktop sign-in. Restored the previous login. If the saved session expired, use Reconnect Desktop.") }
+                try await ClaudeDesktopLauncher.launchAndVerify(app, targetUUID: targetUUID, sessions: sessions, attempts: target == nil ? 600 : 60)
+                stopped = false
                 // Quit once more to flush any cookies rotated during authentication.
                 try await ClaudeDesktopLauncher.stop()
                 stopped = true
                 let connected = try sessions.capture()
                 try sessions.save(connected, account: account)
                 try ClaudeDesktopCodeHistory(repository: repository).synchronize(to: account, accounts: accounts)
-                try ClaudeDesktopLauncher.launch(app)
+                message = "Confirming Claude Desktop after restart…"
+                try await ClaudeDesktopLauncher.launchAndVerify(app, targetUUID: targetUUID, sessions: sessions)
                 stopped = false
                 try repository.activate(account, accounts: &accounts)
                 active[.claude] = account.id

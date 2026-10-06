@@ -151,9 +151,64 @@ final class UsageURLProtocol: URLProtocol {
     static func tryLoad(_ sessions: ClaudeDesktopSessions, _ account: SavedAccount) -> ClaudeDesktopSession? { try! sessions.load(account) }
     static func tryCapture(_ sessions: ClaudeDesktopSessions) -> ClaudeDesktopSession { try! sessions.capture() }
 
+    static func desktopVerificationTests() async throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let repository = AccountRepository(home: home, vault: MemoryVault())
+        let sessions = ClaudeDesktopSessions(repository: repository)
+        let outgoing = "11111111-1111-1111-1111-111111111111"
+        let target = "22222222-2222-2222-2222-222222222222"
+        let log = home.appendingPathComponent("Library/Logs/Claude/main.log")
+        func persist(_ uuid: String) throws {
+            try repository.secureWrite(repository.encode(["lastKnownAccountUuid": uuid]), to: sessions.directory.appendingPathComponent("config.json"))
+        }
+        func writeLog(_ text: String) throws { try repository.secureWrite(Data(text.utf8), to: log) }
+        let transition = "[account] Login-state transition (loggedOut: false → false, uuid: \(outgoing) → \(target)), clearing oauth cache\n"
+        try persist(outgoing)
+        try writeLog("[account] Account details received via IPC\n")
+        var polls = 0
+        try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: 0, attempts: 6) {
+            polls += 1
+            if polls == 2 { try writeLog(transition) }
+            if polls == 4 { try persist(target) }
+        }
+        assert(polls == 5, "wait for config persistence and stable identity instead of rolling back on the outgoing UUID")
+
+        // A restart needs its own fresh authentication, even if config still matches.
+        let offset = ClaudeDesktopLauncher.logOffset(home: home)
+        do {
+            try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: offset, attempts: 3, pause: {})
+            fatalError("authentication before the final restart accepted")
+        } catch {}
+        try writeLog(transition + "claude.ai account active and logged in\n")
+        try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: offset, attempts: 2, pause: {})
+
+        // A live wrong-account event must override a matching cached config value.
+        try writeLog("[account] Login-state transition (loggedOut: false → false, uuid: \(target) → \(outgoing)), clearing oauth cache\n[account] Account details received via IPC\n")
+        do {
+            try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: 0, attempts: 3, pause: {})
+            fatalError("wrong live account accepted")
+        } catch {}
+        // A transient match followed by logout is not success.
+        try writeLog(transition)
+        polls = 0
+        do {
+            try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: 0, attempts: 3) {
+                polls += 1
+                if polls == 2 { try writeLog(transition + "[account] Login-state transition (loggedOut: false → true, uuid: \(target) → <none>)\n") }
+            }
+            fatalError("transient login accepted")
+        } catch {}
+        do {
+            try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: 0, pause: { throw CancellationError() })
+            fatalError("cancellation ignored")
+        } catch is CancellationError {} catch { fatalError("cancellation replaced with a sign-in failure") }
+    }
+
     static func main() async throws {
         try desktopCodeHistoryTests()
         try desktopSessionTests()
+        try await desktopVerificationTests()
         try claudeKeychainTests()
         if CommandLine.arguments.contains("--keychain-integration") { try claudeKeychainIntegrationTest() }
         assert(KeychainVault.errorMessage(errSecAuthFailed, signatureStatus: errSecCSStaticCodeChanged).contains("Quit and reopen"))
@@ -230,6 +285,15 @@ final class UsageURLProtocol: URLProtocol {
         try repository.activate(claudeTwo, accounts: &accounts)
         assert(tryRead(vault, repository) == refreshedClaude, "same-account restart keeps refreshed Claude token")
         assert(claudeTwoSecret(repository, claudeTwo) == refreshedClaude, "refreshed Claude token is saved")
+        // A signed-out CLI must not roll a successful Desktop switch back.
+        for emptyOAuth in [[String: Any](), ["claudeAiOauth": ["accessToken": ""]]] {
+            let signedOut = try repository.encode(emptyOAuth)
+            try vault.write(signedOut, repository.claudeService(directory: nil), repository.user)
+            try repository.activate(claudeOne, accounts: &accounts)
+            assert(tryIdentity(repository, .claude) == claudeOne.identity)
+            assert(claudeTwoSecret(repository, claudeTwo) == refreshedClaude, "signed-out credentials cannot replace the saved login")
+            try repository.activate(claudeTwo, accounts: &accounts)
+        }
         // Fail the profile write after the Keychain change and verify rollback.
         vault.onWrite = { service in
             guard service == repository.claudeService(directory: nil) else { return }
