@@ -151,9 +151,64 @@ final class UsageURLProtocol: URLProtocol {
     static func tryLoad(_ sessions: ClaudeDesktopSessions, _ account: SavedAccount) -> ClaudeDesktopSession? { try! sessions.load(account) }
     static func tryCapture(_ sessions: ClaudeDesktopSessions) -> ClaudeDesktopSession { try! sessions.capture() }
 
+    static func desktopVerificationTests() async throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let repository = AccountRepository(home: home, vault: MemoryVault())
+        let sessions = ClaudeDesktopSessions(repository: repository)
+        let outgoing = "11111111-1111-1111-1111-111111111111"
+        let target = "22222222-2222-2222-2222-222222222222"
+        let log = home.appendingPathComponent("Library/Logs/Claude/main.log")
+        func persist(_ uuid: String) throws {
+            try repository.secureWrite(repository.encode(["lastKnownAccountUuid": uuid]), to: sessions.directory.appendingPathComponent("config.json"))
+        }
+        func writeLog(_ text: String) throws { try repository.secureWrite(Data(text.utf8), to: log) }
+        let transition = "[account] Login-state transition (loggedOut: false → false, uuid: \(outgoing) → \(target)), clearing oauth cache\n"
+        try persist(outgoing)
+        try writeLog("[account] Account details received via IPC\n")
+        var polls = 0
+        try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: 0, attempts: 6) {
+            polls += 1
+            if polls == 2 { try writeLog(transition) }
+            if polls == 4 { try persist(target) }
+        }
+        assert(polls == 5, "wait for config persistence and stable identity instead of rolling back on the outgoing UUID")
+
+        // A restart needs its own fresh authentication, even if config still matches.
+        let offset = ClaudeDesktopLauncher.logOffset(home: home)
+        do {
+            try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: offset, attempts: 3, pause: {})
+            fatalError("authentication before the final restart accepted")
+        } catch {}
+        try writeLog(transition + "claude.ai account active and logged in\n")
+        try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: offset, attempts: 2, pause: {})
+
+        // A live wrong-account event must override a matching cached config value.
+        try writeLog("[account] Login-state transition (loggedOut: false → false, uuid: \(target) → \(outgoing)), clearing oauth cache\n[account] Account details received via IPC\n")
+        do {
+            try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: 0, attempts: 3, pause: {})
+            fatalError("wrong live account accepted")
+        } catch {}
+        // A transient match followed by logout is not success.
+        try writeLog(transition)
+        polls = 0
+        do {
+            try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: 0, attempts: 3) {
+                polls += 1
+                if polls == 2 { try writeLog(transition + "[account] Login-state transition (loggedOut: false → true, uuid: \(target) → <none>)\n") }
+            }
+            fatalError("transient login accepted")
+        } catch {}
+        do {
+            try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: 0, pause: { throw CancellationError() })
+            fatalError("cancellation ignored")
+        } catch is CancellationError {} catch { fatalError("cancellation replaced with a sign-in failure") }
+    }
+
     static func main() async throws {
         try desktopCodeHistoryTests()
         try desktopSessionTests()
+        try await desktopVerificationTests()
         try claudeKeychainTests()
         if CommandLine.arguments.contains("--keychain-integration") { try claudeKeychainIntegrationTest() }
         assert(KeychainVault.errorMessage(errSecAuthFailed, signatureStatus: errSecCSStaticCodeChanged).contains("Quit and reopen"))
@@ -230,6 +285,15 @@ final class UsageURLProtocol: URLProtocol {
         try repository.activate(claudeTwo, accounts: &accounts)
         assert(tryRead(vault, repository) == refreshedClaude, "same-account restart keeps refreshed Claude token")
         assert(claudeTwoSecret(repository, claudeTwo) == refreshedClaude, "refreshed Claude token is saved")
+        // A signed-out CLI must not roll a successful Desktop switch back.
+        for emptyOAuth in [[String: Any](), ["claudeAiOauth": ["accessToken": ""]]] {
+            let signedOut = try repository.encode(emptyOAuth)
+            try vault.write(signedOut, repository.claudeService(directory: nil), repository.user)
+            try repository.activate(claudeOne, accounts: &accounts)
+            assert(tryIdentity(repository, .claude) == claudeOne.identity)
+            assert(claudeTwoSecret(repository, claudeTwo) == refreshedClaude, "signed-out credentials cannot replace the saved login")
+            try repository.activate(claudeTwo, accounts: &accounts)
+        }
         // Fail the profile write after the Keychain change and verify rollback.
         vault.onWrite = { service in
             guard service == repository.claudeService(directory: nil) else { return }
@@ -297,6 +361,7 @@ final class UsageURLProtocol: URLProtocol {
         let session = URLSession(configuration: configuration)
         UsageURLProtocol.handler = { request in
             if request.url?.path == "/v1/oauth/token" {
+                assert(request.url?.host == "platform.claude.com")
                 var bodyData = request.httpBody ?? Data()
                 if bodyData.isEmpty, let stream = request.httpBodyStream {
                     stream.open()
@@ -328,7 +393,69 @@ final class UsageURLProtocol: URLProtocol {
         assert(claudeKeychainReads == 0, "usage refresh does not read Claude Code Keychain")
         let fallbackRefresh = try repository.object(Data(contentsOf: root.appendingPathComponent(".claude/.credentials.json")))["claudeAiOauth"] as! [String: Any]
         assert(fallbackRefresh["accessToken"] as? String == "renewed", "matching file credentials receive refreshed token")
+        for status in [400, 403, 429, 503] {
+            UsageURLProtocol.handler = { request in
+                if request.url?.path == "/v1/oauth/token" {
+                    return (status, try repository.encode(["error": status == 400 ? "invalid_grant" : "temporary_failure"]))
+                }
+                return (401, Data())
+            }
+            do {
+                _ = try await repository.usage(storedRefresh, session: session)
+                fatalError("failed refresh unexpectedly succeeded")
+            } catch let error as AccountError {
+                switch error {
+                case .signInRequired: assert(status == 400, "only revoked credentials require login")
+                case .rateLimited: assert(status == 429)
+                case .message: assert(status == 403 || status == 503, "transient refresh failure is retryable")
+                }
+            }
+        }
+        let beforeWrongLogin = vault.values
+        do {
+            try repository.reconnectClaude(storedRefresh, secret: claude("wrong-account"))
+            fatalError("reconnect accepted a different browser account")
+        } catch {}
+        assert(vault.values == beforeWrongLogin, "wrong-account reconnect changes no credentials")
+        let fresh = AccountSecret(credentials: try repository.encode(["claudeAiOauth": ["accessToken": "fresh-login", "refreshToken": "fresh-refresh", "expiresAt": 2]]), profile: refreshSecret.profile)
+        try repository.reconnectClaude(storedRefresh, secret: fresh)
+        assert(try! repository.secret(storedRefresh).credentials == fresh.credentials, "explicit login replaces revoked token despite earlier expiry")
+        assert(tryRead(vault, repository) == fresh.credentials, "reconnect updates active Code credentials")
+        assert(try! Data(contentsOf: root.appendingPathComponent(".claude/.credentials.json")) == fresh.credentials)
+        let currentBeforeInactiveLogin = tryRead(vault, repository)
+        try repository.reconnectClaude(claudeOne, secret: claude("c1"))
+        assert(tryRead(vault, repository) == currentBeforeInactiveLogin, "reconnecting an inactive account preserves the active login")
+        for (url, data) in desktopFiles {
+            assert(try! Data(contentsOf: url) == data, "Code reconnect preserves Desktop login and history")
+        }
+        try await usageRecoveryModelTests(repository, account: storedRefresh, session: session)
         print("Account tests passed: switching, token preservation, Claude Desktop history preservation, usage parsing, Claude OAuth refresh and retry.")
+    }
+    @MainActor static func usageRecoveryModelTests(_ repository: AccountRepository, account: SavedAccount, session: URLSession) async throws {
+        let model = AccountsModel(repository: repository, usageSession: session)
+        model.accounts = [account]
+        UsageURLProtocol.handler = { request in
+            request.url?.path == "/v1/oauth/token"
+                ? (400, try repository.encode(["error": "invalid_grant"]))
+                : (401, Data())
+        }
+        model.refresh()
+        while model.refreshing { try await Task.sleep(for: .milliseconds(10)) }
+        assert(model.usage[account.id]?.requiresSignIn == true)
+        var requests = 0
+        UsageURLProtocol.handler = { _ in
+            requests += 1
+            return (200, try repository.encode(["five_hour": ["utilization": 12]]))
+        }
+        model.refresh()
+        while model.refreshing { try await Task.sleep(for: .milliseconds(10)) }
+        assert(requests == 0, "automatic refresh observes polling delay")
+        model.refresh()
+        model.refresh(forceUsage: true)
+        while model.refreshing { try await Task.sleep(for: .milliseconds(10)) }
+        assert(requests == 1, "explicit recovery bypasses polling delay even during another refresh")
+        assert(model.usage[account.id]?.requiresSignIn == false && model.usage[account.id]?.error == nil)
+        assert(model.usage[account.id]?.windows.first?.used == 12)
     }
     static func tryIdentity(_ repo: AccountRepository, _ provider: AccountProvider) -> String { try! repo.identity(repo.capture(provider)!, provider: provider).0 }
     static func claudeTwoSecret(_ repo: AccountRepository, _ account: SavedAccount) -> Data { try! repo.secret(account).credentials }
