@@ -20,7 +20,7 @@ Open **Settings** with the gear button or `⌘,` to change the shortcut. Press a
 
 ## ccs mini
 
-[Download ccs mini](https://github.com/bokuweb/ccs/releases/tag/mini-v0.1.12) if you only need account switching and usage in the menu bar. Open `ccs-mini.dmg`, drag `ccs-mini.app` onto **Applications**, and launch it from Applications. Click its menu bar icon to open the compact dropdown; mini has no conversation search or session indexing.
+[Download ccs mini](https://github.com/bokuweb/ccs/releases/tag/mini-v0.1.13) if you only need account switching and usage in the menu bar. Open `ccs-mini.dmg`, drag `ccs-mini.app` onto **Applications**, and launch it from Applications. Click its menu bar icon to open the compact dropdown; mini has no conversation search or session indexing.
 
 <p align="center">
   <img src="assets/ccs-mini.png" width="800" alt="ccs mini menu bar dropdown showing Codex and Claude accounts and usage rings with example email addresses">
