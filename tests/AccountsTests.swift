@@ -167,12 +167,12 @@ final class UsageURLProtocol: URLProtocol {
         try persist(outgoing)
         try writeLog("[account] Account details received via IPC\n")
         var polls = 0
-        try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: 0, attempts: 6) {
+        try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: 0, attempts: 9) {
             polls += 1
             if polls == 2 { try writeLog(transition) }
             if polls == 4 { try persist(target) }
         }
-        assert(polls == 5, "wait for config persistence and stable identity instead of rolling back on the outgoing UUID")
+        assert(polls == 8, "wait for config persistence and Code authorization to settle instead of rolling back on the outgoing UUID")
 
         // A restart needs its own fresh authentication, even if config still matches.
         let offset = ClaudeDesktopLauncher.logOffset(home: home)
@@ -181,7 +181,61 @@ final class UsageURLProtocol: URLProtocol {
             fatalError("authentication before the final restart accepted")
         } catch {}
         try writeLog(transition + "claude.ai account active and logged in\n")
-        try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: offset, attempts: 2, pause: {})
+        try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: offset, attempts: 5, pause: {})
+
+        // Desktop 2.31226.1 accepts the web login, then refuses Code's scope
+        // expansion. Neither IPC nor repeated web-login events erase the refusal.
+        let stale = "[info] oauth failed: authorize returned 403 <json error=permission_error code=session_stale_relogin len=238>\n"
+        try writeLog(transition)
+        polls = 0
+        do {
+            try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: 0, attempts: 10) {
+                polls += 1
+                if polls == 3 { try writeLog(transition + stale + "[account] Account details received via IPC\nclaude.ai account active and logged in\n") }
+            }
+            fatalError("web login accepted while Code requires a fresh sign-in")
+        } catch is ClaudeDesktopLauncher.FreshLoginRequired {
+            assert(polls == 3, "detect the refusal before reporting success")
+        }
+        // An outgoing account's refusal must not poison a new login transition.
+        try writeLog(stale + transition)
+        try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: 0, attempts: 5, pause: {})
+
+        var reconnects: [Bool] = []
+        try await ClaudeDesktopLauncher.withFreshLoginRetry { reconnect in
+            reconnects.append(reconnect)
+            try writeLog(transition + (reconnect ? "" : stale))
+            try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: 0, attempts: 5, pause: {})
+        }
+        assert(reconnects == [false, true], "a stale stored login automatically enters fresh sign-in once")
+        reconnects = []
+        try await ClaudeDesktopLauncher.withFreshLoginRetry { reconnect in
+            reconnects.append(reconnect)
+            try writeLog(transition)
+            try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: 0, attempts: 5, pause: {})
+            let restartOffset = ClaudeDesktopLauncher.logOffset(home: home)
+            try writeLog(transition + "claude.ai account active and logged in\n" + (reconnect ? "" : stale))
+            try await ClaudeDesktopLauncher.waitForAccount(target, sessions: sessions, since: restartOffset, attempts: 5, pause: {})
+        }
+        assert(reconnects == [false, true], "a refusal on the final restart also enters fresh sign-in")
+        reconnects = []
+        do {
+            try await ClaudeDesktopLauncher.withFreshLoginRetry { reconnect in
+                reconnects.append(reconnect)
+                throw ClaudeDesktopLauncher.FreshLoginRequired()
+            }
+            fatalError("repeated refusal accepted")
+        } catch is ClaudeDesktopLauncher.FreshLoginRequired {
+            assert(reconnects == [false, true], "never loop indefinitely through sign-in")
+        }
+        reconnects = []
+        do {
+            try await ClaudeDesktopLauncher.withFreshLoginRetry { reconnect in
+                reconnects.append(reconnect)
+                throw CancellationError()
+            }
+            fatalError("cancellation ignored during reconnect")
+        } catch is CancellationError { assert(reconnects == [false]) }
 
         // A live wrong-account event must override a matching cached config value.
         try writeLog("[account] Login-state transition (loggedOut: false → false, uuid: \(target) → \(outgoing)), clearing oauth cache\n[account] Account details received via IPC\n")
