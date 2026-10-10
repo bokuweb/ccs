@@ -385,10 +385,25 @@ enum ClaudeDesktopLauncher {
     struct Authentication {
         var signedIn = false
         var accountUUID: String?
+        var requiresFreshLogin = false
 
         func matches(_ targetUUID: String, persistedUUID: String?) -> Bool {
-            signedIn && persistedUUID?.lowercased() == targetUUID &&
+            signedIn && !requiresFreshLogin && persistedUUID?.lowercased() == targetUUID &&
                 (accountUUID == nil || accountUUID == targetUUID)
+        }
+    }
+    struct FreshLoginRequired: LocalizedError {
+        var errorDescription: String? {
+            "Claude Desktop requires a fresh sign-in for its Code tab. Retry with Reconnect Desktop."
+        }
+    }
+    // A saved web session can still open Chat while Code's scope expansion is
+    // refused by the server. Retry once through Desktop's normal sign-in UI.
+    static func withFreshLoginRetry(_ operation: (Bool) async throws -> Void) async throws {
+        do { try await operation(false) }
+        catch is FreshLoginRequired {
+            try Task.checkCancellation()
+            try await operation(true)
         }
     }
     static func authentication(home: URL, since offset: UInt64) -> Authentication {
@@ -408,8 +423,12 @@ enum ClaudeDesktopLauncher {
                 result.signedIn = login == "false"
                 let uuid = line[separator.upperBound..<end].components(separatedBy: " → ").last ?? ""
                 result.accountUUID = UUID(uuidString: uuid)?.uuidString.lowercased()
+                result.requiresFreshLogin = false
             }
             if line.contains("[account] User is logged out") || line.contains("[account] User logged out during IPC") { result = Authentication() }
+            if line.contains("oauth failed: authorize returned 403"), line.contains("session_stale_relogin") {
+                result.requiresFreshLogin = true
+            }
         }
         return result
     }
@@ -424,10 +443,17 @@ enum ClaudeDesktopLauncher {
             try Task.checkCancellation()
             try await pause()
             let state = authentication(home: sessions.repository.home, since: offset)
+            if state.requiresFreshLogin, state.signedIn,
+               sessions.accountUUID()?.lowercased() == targetUUID,
+               state.accountUUID == nil || state.accountUUID == targetUUID {
+                throw FreshLoginRequired()
+            }
             // Desktop emits its login event before persisting lastKnownAccountUuid.
             // An outgoing UUID during startup is pending, not a failed switch.
             matches = state.matches(targetUUID, persistedUUID: sessions.accountUUID()) ? matches + 1 : 0
-            if matches >= 2 { return }
+            // Code's /authorize runs just after the web account IPC event. Give
+            // its refusal time to arrive before declaring the switch successful.
+            if matches >= 5 { return }
         }
         throw AccountError.message("Could not verify the selected Claude Desktop account. Restored the previous login. Retry, or use Reconnect Desktop if the saved session expired.")
     }
@@ -982,17 +1008,30 @@ final class AccountRepository {
                 if target == nil {
                     message = "First connection: sign in to Claude Desktop as \(account.name). ccs will save this Desktop login for future switches. History stays in place."
                 } else { message = "Checking Claude Desktop sign-in for \(account.name)…" }
-                try await ClaudeDesktopLauncher.launchAndVerify(app, targetUUID: targetUUID, sessions: sessions, attempts: target == nil ? 600 : 60)
-                stopped = false
-                // Quit once more to flush any cookies rotated during authentication.
-                try await ClaudeDesktopLauncher.stop()
-                stopped = true
-                let connected = try sessions.capture()
-                try sessions.save(connected, account: account)
-                try ClaudeDesktopCodeHistory(repository: repository).synchronize(to: account, accounts: accounts)
-                message = "Confirming Claude Desktop after restart…"
-                try await ClaudeDesktopLauncher.launchAndVerify(app, targetUUID: targetUUID, sessions: sessions)
-                stopped = false
+                try await ClaudeDesktopLauncher.withFreshLoginRetry { reconnect in
+                    if reconnect {
+                        try await ClaudeDesktopLauncher.stop()
+                        stopped = true
+                        var signedOut = current
+                        signedOut.rows = []
+                        try sessions.restore(signedOut)
+                        waitingForDesktopLogin = true
+                        message = "Claude Desktop needs a fresh sign-in for Code. Sign in as \(account.name); ccs will save the renewed login."
+                    }
+                    try await ClaudeDesktopLauncher.launchAndVerify(app, targetUUID: targetUUID, sessions: sessions, attempts: reconnect || target == nil ? 600 : 60)
+                    stopped = false
+                    // Quit once more to flush cookies rotated during authentication.
+                    try await ClaudeDesktopLauncher.stop()
+                    stopped = true
+                    let connected = try sessions.capture()
+                    try sessions.validate(connected, account: account)
+                    try ClaudeDesktopCodeHistory(repository: repository).synchronize(to: account, accounts: accounts)
+                    message = "Confirming Claude Desktop after restart…"
+                    try await ClaudeDesktopLauncher.launchAndVerify(app, targetUUID: targetUUID, sessions: sessions)
+                    stopped = false
+                    // A rejected login must not replace the previous saved session.
+                    try sessions.save(connected, account: account)
+                }
                 try repository.activate(account, accounts: &accounts)
                 active[.claude] = account.id
                 desktopActive = account.id
